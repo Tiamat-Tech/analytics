@@ -1,25 +1,31 @@
 defmodule PlausibleWeb.AuthView do
+  use Plausible
   use PlausibleWeb, :view
   alias Plausible.Billing.Plans
 
-  def admin_email do
-    Application.get_env(:plausible, :admin_email)
-  end
+  def subscription_quota(subscription, options \\ [])
 
-  def base_domain do
-    PlausibleWeb.Endpoint.host()
-  end
+  def subscription_quota(nil, _options), do: "Free trial"
 
-  def plausible_url do
-    PlausibleWeb.Endpoint.url()
-  end
+  def subscription_quota(subscription, options) do
+    pageview_limit = Plausible.Teams.Billing.monthly_pageview_limit(subscription)
 
-  def subscription_quota(subscription) do
-    Plans.allowance(subscription) |> PlausibleWeb.StatsView.large_number_format()
+    quota =
+      if pageview_limit == :unlimited do
+        "unlimited"
+      else
+        PlausibleWeb.StatsView.large_number_format(pageview_limit)
+      end
+
+    if Keyword.get(options, :format) == :long do
+      "#{quota} pageviews"
+    else
+      quota
+    end
   end
 
   def subscription_interval(subscription) do
-    Plans.subscription_interval(subscription.paddle_plan_id)
+    Plans.subscription_interval(subscription)
   end
 
   def delimit_integer(number) do
@@ -36,16 +42,4 @@ defmodule PlausibleWeb.AuthView do
   defp delimit_integer(list, acc) do
     :lists.reverse(list) ++ acc
   end
-
-  def present_subscription_status("active"), do: "Active"
-  def present_subscription_status("past_due"), do: "Past due"
-  def present_subscription_status("deleted"), do: "Cancelled"
-  def present_subscription_status("paused"), do: "Paused"
-  def present_subscription_status(status), do: status
-
-  def subscription_colors("active"), do: "bg-green-100 text-green-800"
-  def subscription_colors("past_due"), do: "bg-yellow-100 text-yellow-800"
-  def subscription_colors("paused"), do: "bg-red-100 text-red-800"
-  def subscription_colors("deleted"), do: "bg-red-100 text-red-800"
-  def subscription_colors(_), do: ""
 end

@@ -1,12 +1,14 @@
-import {formatISO} from './date'
+import { formatISO } from './util/date'
+import { serializeApiFilters } from './util/filters'
 
 let abortController = new AbortController()
 let SHARED_LINK_AUTH = null
 
 class ApiError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "ApiError";
+  constructor(message, payload) {
+    super(message)
+    this.name = "ApiError"
+    this.payload = payload
   }
 }
 
@@ -29,35 +31,46 @@ export function cancelAll() {
   abortController = new AbortController()
 }
 
-function serializeFilters(filters) {
-  const cleaned = {}
-  Object.entries(filters).forEach(([key, val]) => val ? cleaned[key] = val : null);
-  return JSON.stringify(cleaned)
-}
-
-export function serializeQuery(query, extraQuery=[]) {
+export function serializeQuery(query, extraQuery = []) {
   const queryObj = {}
-  if (query.period)  { queryObj.period = query.period  }
-  if (query.date)    { queryObj.date = formatISO(query.date)  }
-  if (query.from)    { queryObj.from = formatISO(query.from)  }
-  if (query.to)      { queryObj.to = formatISO(query.to)  }
-  if (query.filters) { queryObj.filters = serializeFilters(query.filters)  }
+  if (query.period) { queryObj.period = query.period }
+  if (query.date) { queryObj.date = formatISO(query.date) }
+  if (query.from) { queryObj.from = formatISO(query.from) }
+  if (query.to) { queryObj.to = formatISO(query.to) }
+  if (query.filters) { queryObj.filters = serializeApiFilters(query.filters) }
+  if (query.with_imported) { queryObj.with_imported = query.with_imported }
   if (SHARED_LINK_AUTH) { queryObj.auth = SHARED_LINK_AUTH }
+
+  if (query.comparison) {
+    queryObj.comparison = query.comparison
+    queryObj.compare_from = query.compare_from ? formatISO(query.compare_from) : undefined
+    queryObj.compare_to = query.compare_to ? formatISO(query.compare_to) : undefined
+    queryObj.match_day_of_week = query.match_day_of_week
+  }
+
   Object.assign(queryObj, ...extraQuery)
 
   return '?' + serialize(queryObj)
 }
 
-export function get(url, query={}, ...extraQuery) {
-  const headers = SHARED_LINK_AUTH ? {'X-Shared-Link-Auth': SHARED_LINK_AUTH} : {}
+export function get(url, query = {}, ...extraQuery) {
+  const headers = SHARED_LINK_AUTH ? { 'X-Shared-Link-Auth': SHARED_LINK_AUTH } : {}
   url = url + serializeQuery(query, extraQuery)
-  return fetch(url, {signal: abortController.signal, headers: headers})
-    .then( response => {
+  return fetch(url, { signal: abortController.signal, headers: headers })
+    .then(response => {
       if (!response.ok) {
-        return response.json().then((msg) => {
-          throw new ApiError(msg.error)
+        return response.json().then((payload) => {
+          throw new ApiError(payload.error, payload)
         })
       }
       return response.json()
     })
+}
+
+export function put(url, body) {
+  return fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  })
 }

@@ -8,6 +8,13 @@ defmodule PlausibleWeb.Api.Helpers do
     |> halt()
   end
 
+  def not_enough_permissions(conn, msg) do
+    conn
+    |> put_status(403)
+    |> Phoenix.Controller.json(%{error: msg})
+    |> halt()
+  end
+
   def bad_request(conn, msg) do
     conn
     |> put_status(400)
@@ -25,6 +32,13 @@ defmodule PlausibleWeb.Api.Helpers do
   def too_many_requests(conn, msg) do
     conn
     |> put_status(429)
+    |> Phoenix.Controller.json(%{error: msg})
+    |> halt()
+  end
+
+  def payment_required(conn, msg) do
+    conn
+    |> put_status(402)
     |> Phoenix.Controller.json(%{error: msg})
     |> halt()
   end

@@ -1,9 +1,31 @@
-import "../css/app.css"
-import "flatpickr/dist/flatpickr.min.css"
 import "./polyfills/closest"
 import 'abortcontroller-polyfill/dist/polyfill-patch-fetch'
-import "phoenix_html"
-import 'alpinejs'
+import Alpine from 'alpinejs'
+import "./liveview/live_socket"
+import comboBox from "./liveview/combo-box"
+import dropdown from "./liveview/dropdown"
+import "./liveview/phx_events"
+
+Alpine.data('dropdown', dropdown)
+Alpine.data('comboBox', comboBox)
+Alpine.start()
+
+if (document.querySelectorAll('[data-modal]').length > 0) {
+  window.addEventListener(`phx:close-modal`, (e) => {
+    document
+      .getElementById(e.detail.id)
+      .dispatchEvent(
+        new CustomEvent('close-modal', { bubbles: true, detail: e.detail.id })
+      )
+  })
+  window.addEventListener(`phx:open-modal`, (e) => {
+    document
+      .getElementById(e.detail.id)
+      .dispatchEvent(
+        new CustomEvent('open-modal', { bubbles: true, detail: e.detail.id })
+      )
+  })
+}
 
 const triggers = document.querySelectorAll('[data-dropdown-trigger]')
 
@@ -34,36 +56,17 @@ if (triggers.length > 0) {
   })
 }
 
-const registerForm = document.getElementById('register-form')
-
-if (registerForm) {
-  registerForm.addEventListener('submit', function(e) {
-    e.preventDefault();
-    setTimeout(submitForm, 1000);
-    var formSubmitted = false;
-
-    function submitForm() {
-      if (!formSubmitted) {
-        formSubmitted = true;
-        registerForm.submit();
-      }
-    }
-    /* eslint-disable-next-line no-undef */
-    plausible('Signup', {callback: submitForm});
-  })
-}
-
 const changelogNotification = document.getElementById('changelog-notification')
 
 if (changelogNotification) {
   showChangelogNotification(changelogNotification)
 
-  fetch('https://plausible.io/changes.txt', {headers: {'Content-Type': 'text/plain'}})
+  fetch('https://plausible.io/changes.txt', { headers: { 'Content-Type': 'text/plain' } })
     .then((res) => res.text())
     .then((res) => {
       localStorage.lastChangelogUpdate = new Date(res).getTime()
       showChangelogNotification(changelogNotification)
-  })
+    })
 }
 
 function showChangelogNotification(el) {
@@ -71,7 +74,7 @@ function showChangelogNotification(el) {
   const lastChecked = Number(localStorage.lastChangelogClick)
 
   const hasNewUpdateSinceLastClicked = lastUpdated > lastChecked
-  const notOlderThanThreeDays = Date.now() - lastUpdated <  1000 * 60 * 60 * 72
+  const notOlderThanThreeDays = Date.now() - lastUpdated < 1000 * 60 * 60 * 72
   if ((!lastChecked || hasNewUpdateSinceLastClicked) && notOlderThanThreeDays) {
     el.innerHTML = `
       <a href="https://plausible.io/changelog" target="_blank">

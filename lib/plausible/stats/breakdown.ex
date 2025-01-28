@@ -1,438 +1,186 @@
 defmodule Plausible.Stats.Breakdown do
+  @moduledoc """
+  Builds breakdown results for v1 of our stats API and dashboards.
+
+  Avoid adding new logic here - update QueryBuilder etc instead.
+  """
+
   use Plausible.ClickhouseRepo
-  import Plausible.Stats.Base
-  alias Plausible.Stats.Query
-  @no_ref "Direct / None"
+  use Plausible.Stats.SQL.Fragments
 
-  @event_metrics ["visitors", "pageviews", "events"]
-  @session_metrics ["visits", "bounce_rate", "visit_duration"]
-  @event_props ["event:page", "event:page_match", "event:name"]
+  alias Plausible.Stats.{Query, QueryRunner, QueryResult, QueryOptimizer, Comparisons}
 
-  def breakdown(site, query, "event:goal", metrics, pagination) do
-    {event_goals, pageview_goals} =
-      Plausible.Repo.all(from g in Plausible.Goal, where: g.domain == ^site.domain)
-      |> Enum.split_with(fn goal -> goal.event_name end)
+  def breakdown(
+        site,
+        %Query{dimensions: [dimension], order_by: order_by} = query,
+        metrics,
+        {limit, page},
+        _opts \\ []
+      ) do
+    transformed_metrics = transform_metrics(metrics, dimension)
+    transformed_order_by = transform_order_by(order_by || [], dimension)
 
-    events = Enum.map(event_goals, & &1.event_name)
-    event_query = %Query{query | filters: Map.put(query.filters, "event:name", {:member, events})}
-
-    event_results =
-      if Enum.any?(event_goals) do
-        breakdown(site, event_query, "event:name", metrics, pagination)
-        |> transform_keys(%{"name" => "goal"})
-      else
-        []
-      end
-
-    {limit, page} = pagination
-    offset = (page - 1) * limit
-
-    page_results =
-      if Enum.any?(pageview_goals) do
-        page_exprs = Enum.map(pageview_goals, & &1.page_path)
-        page_regexes = Enum.map(page_exprs, &page_regex/1)
-
-        from(e in base_event_query(site, query),
-          order_by: [desc: fragment("uniq(?)", e.user_id)],
-          limit: ^limit,
-          offset: ^offset,
-          where:
-            fragment(
-              "notEmpty(multiMatchAllIndices(?, array(?)) as indices)",
-              e.pathname,
-              ^page_regexes
-            ),
-          group_by: fragment("index"),
-          select: %{
-            "index" => fragment("arrayJoin(indices) as index"),
-            "goal" => fragment("concat('Visit ', array(?)[index])", ^page_exprs)
-          }
-        )
-        |> select_event_metrics(metrics)
-        |> ClickhouseRepo.all()
-        |> Enum.map(fn row -> Map.delete(row, "index") end)
-      else
-        []
-      end
-
-    zip_results(event_results, page_results, "event:goal", metrics)
-  end
-
-  def breakdown(site, query, "event:props:" <> custom_prop, metrics, pagination) do
-    none_result =
-      if !Enum.any?(query.filters, fn {key, _} -> String.starts_with?(key, "event:props") end) do
-        none_filters = Map.put(query.filters, "event:props:" <> custom_prop, {:is, "(none)"})
-        none_query = %Query{query | filters: none_filters}
-
-        {limit, page} = pagination
-        offset = (page - 1) * limit
-
-        from(e in base_event_query(site, none_query),
-          order_by: [desc: fragment("uniq(?)", e.user_id)],
-          limit: ^limit,
-          offset: ^offset,
-          select: %{},
-          select_merge: %{^custom_prop => "(none)"},
-          having: fragment("uniq(?)", e.user_id) > 0
-        )
-        |> select_event_metrics(metrics)
-        |> ClickhouseRepo.all()
-      else
-        []
-      end
-
-    results = breakdown_events(site, query, "event:props:" <> custom_prop, metrics, pagination)
-    zip_results(none_result, results, custom_prop, metrics)
-  end
-
-  def breakdown(site, query, "event:page", metrics, pagination) do
-    event_metrics = Enum.filter(metrics, &(&1 in @event_metrics))
-    session_metrics = Enum.filter(metrics, &(&1 in @session_metrics))
-
-    event_result = breakdown_events(site, query, "event:page", event_metrics, pagination)
-
-    event_result =
-      if "time_on_page" in metrics do
-        pages = Enum.map(event_result, & &1["page"])
-        time_on_page_result = breakdown_time_on_page(site, query, pages)
-
-        Enum.map(event_result, fn row ->
-          Map.put(row, "time_on_page", time_on_page_result[row["page"]])
-        end)
-      else
-        event_result
-      end
-
-    new_query =
-      case event_result do
-        [] ->
-          query
-
-        pages ->
-          Query.put_filter(query, "visit:entry_page", {:member, Enum.map(pages, & &1["page"])})
-      end
-
-    {limit, _page} = pagination
-
-    session_result =
-      breakdown_sessions(site, new_query, "visit:entry_page", session_metrics, {limit, 1})
-      |> transform_keys(%{"entry_page" => "page"})
-
-    zip_results(
-      event_result,
-      session_result,
-      "event:page",
-      metrics
-    )
-  end
-
-  def breakdown(site, query, property, metrics, pagination) when property in @event_props do
-    breakdown_events(site, query, property, metrics, pagination)
-  end
-
-  def breakdown(site, query, property, metrics, pagination)
-      when property in [
-             "visit:source",
-             "visit:utm_medium",
-             "visit:utm_source",
-             "visit:utm_campaign"
-           ] do
-    query = Query.treat_page_filter_as_entry_page(query)
-    breakdown_sessions(site, query, property, metrics, pagination)
-  end
-
-  def breakdown(site, query, property, metrics, pagination) do
-    breakdown_sessions(site, query, property, metrics, pagination)
-  end
-
-  defp zip_results(event_result, session_result, property, metrics) do
-    sort_by = if Enum.member?(metrics, "visitors"), do: "visitors", else: List.first(metrics)
-
-    property =
-      property
-      |> String.trim_leading("event:")
-      |> String.trim_leading("visit:")
-      |> String.trim_leading("props:")
-
-    null_row = Enum.map(metrics, fn metric -> {metric, nil} end) |> Enum.into(%{})
-
-    prop_values =
-      Enum.map(event_result ++ session_result, fn row -> row[property] end)
-      |> Enum.uniq()
-
-    Enum.map(prop_values, fn value ->
-      event_row = Enum.find(event_result, fn row -> row[property] == value end) || %{}
-      session_row = Enum.find(session_result, fn row -> row[property] == value end) || %{}
-
-      Map.merge(null_row, event_row)
-      |> Map.merge(session_row)
-    end)
-    |> Enum.sort_by(fn row -> row[sort_by] end, :desc)
-  end
-
-  defp breakdown_sessions(_, _, _, [], _), do: []
-
-  defp breakdown_sessions(site, query, property, metrics, {limit, page}) do
-    offset = (page - 1) * limit
-
-    from(s in query_sessions(site, query),
-      order_by: [desc: fragment("uniq(?)", s.user_id), asc: fragment("min(?)", s.start)],
-      limit: ^limit,
-      offset: ^offset,
-      select: %{}
-    )
-    |> filter_converted_sessions(site, query)
-    |> do_group_by(property)
-    |> select_session_metrics(metrics)
-    |> ClickhouseRepo.all()
-  end
-
-  defp breakdown_events(_, _, _, [], _), do: []
-
-  defp breakdown_events(site, query, property, metrics, {limit, page}) do
-    offset = (page - 1) * limit
-
-    from(e in base_event_query(site, query),
-      order_by: [desc: fragment("uniq(?)", e.user_id)],
-      limit: ^limit,
-      offset: ^offset,
-      select: %{}
-    )
-    |> do_group_by(property)
-    |> select_event_metrics(metrics)
-    |> ClickhouseRepo.all()
-  end
-
-  defp breakdown_time_on_page(site, query, pages) do
-    q =
-      from(
-        e in base_event_query(site, %Query{
-          query
-          | filters: Map.delete(query.filters, "event:page")
-        }),
-        select: {
-          fragment("? as p", e.pathname),
-          fragment("? as t", e.timestamp),
-          fragment("? as s", e.session_id)
-        },
-        order_by: [e.session_id, e.timestamp]
+    query_with_metrics =
+      query
+      |> Query.set(
+        metrics: transformed_metrics,
+        # Concat client requested order with default order, overriding only if client explicitly requests it
+        order_by:
+          Enum.concat(transformed_order_by, infer_order_by(transformed_metrics, dimension))
+          |> Enum.uniq_by(&elem(&1, 0)),
+        dimensions: transform_dimensions(dimension),
+        filters: query.filters ++ dimension_filters(dimension),
+        pagination: %{limit: limit, offset: (page - 1) * limit},
+        # Allow pageview and event metrics to be queried off of sessions table
+        legacy_breakdown: true,
+        remove_unavailable_revenue_metrics: true
       )
+      |> QueryOptimizer.optimize()
 
-    {base_query_raw, base_query_raw_params} = ClickhouseRepo.to_sql(:all, q)
+    %QueryResult{results: results, meta: meta} = QueryRunner.run(site, query_with_metrics)
 
-    time_query = "
-      SELECT
-        p,
-        sum(td)/count(case when p2 != p then 1 end) as avgTime
-      FROM
-        (SELECT
-          p,
-          p2,
-          sum(t2-t) as td
-        FROM
-          (SELECT
-            *,
-            neighbor(t, 1) as t2,
-            neighbor(p, 1) as p2,
-            neighbor(s, 1) as s2
-          FROM (#{base_query_raw}))
-        WHERE s=s2 AND p IN tuple(?)
-        GROUP BY p,p2,s)
-      GROUP BY p"
-
-    {:ok, res} = ClickhouseRepo.query(time_query, base_query_raw_params ++ [pages])
-    res.rows |> Enum.map(fn [page, time] -> {page, time} end) |> Enum.into(%{})
+    %{
+      results: build_breakdown_result(results, query_with_metrics, metrics),
+      meta: meta
+    }
   end
 
-  defp do_group_by(
-         %Ecto.Query{
-           from: %Ecto.Query.FromExpr{source: {"events", _}},
-           joins: [%Ecto.Query.JoinExpr{source: {"meta", _}}]
-         } = q,
-         "event:props:" <> prop
-       ) do
-    from(
-      [e, meta] in q,
-      group_by: e.name,
-      where: meta.key == ^prop,
-      group_by: meta.value,
-      select_merge: %{^prop => meta.value}
-    )
-  end
+  def formatted_date_ranges(query) do
+    formatted = %{
+      date_range_label: format_date_range(query)
+    }
 
-  defp do_group_by(
-         %Ecto.Query{from: %Ecto.Query.FromExpr{source: {"events", _}}} = q,
-         "event:props:" <> prop
-       ) do
-    from(
-      e in q,
-      inner_lateral_join: meta in fragment("meta"),
-      where: meta.key == ^prop,
-      group_by: meta.value,
-      select_merge: %{^prop => meta.value}
-    )
-  end
+    if query.include.comparisons do
+      comparison_date_range_label =
+        query
+        |> Comparisons.get_comparison_query(query.include.comparisons)
+        |> format_date_range()
 
-  defp do_group_by(
-         %Ecto.Query{from: %Ecto.Query.FromExpr{source: {"events", _}}} = q,
-         "event:name"
-       ) do
-    from(
-      e in q,
-      group_by: e.name,
-      select_merge: %{"name" => e.name}
-    )
-  end
-
-  defp do_group_by(
-         %Ecto.Query{from: %Ecto.Query.FromExpr{source: {"events", _}}} = q,
-         "event:page"
-       ) do
-    from(
-      e in q,
-      group_by: e.pathname,
-      select_merge: %{"page" => e.pathname}
-    )
-  end
-
-  defp do_group_by(
-         %Ecto.Query{from: %Ecto.Query.FromExpr{source: {"events", _}}} = q,
-         "event:page_match"
-       ) do
-    case Map.get(q, :__private_match_sources__) do
-      match_exprs when is_list(match_exprs) ->
-        from(
-          e in q,
-          group_by: fragment("index"),
-          select_merge: %{
-            "index" => fragment("arrayJoin(indices) as index"),
-            "page_match" => fragment("array(?)[index]", ^match_exprs)
-          }
-        )
+      Map.put(
+        formatted,
+        :comparison_date_range_label,
+        comparison_date_range_label
+      )
+    else
+      formatted
     end
   end
 
-  defp do_group_by(q, "visit:source") do
-    from(
-      s in q,
-      group_by: s.referrer_source,
-      select_merge: %{
-        "source" => fragment("if(empty(?), ?, ?)", s.referrer_source, @no_ref, s.referrer_source)
-      }
-    )
-  end
+  defp build_breakdown_result(results, query, metrics) do
+    dimension_keys = query.dimensions |> Enum.map(&result_key/1)
 
-  defp do_group_by(q, "visit:country") do
-    from(
-      s in q,
-      group_by: s.country_code,
-      where: s.country_code != "\0\0",
-      select_merge: %{"country" => s.country_code}
-    )
-  end
+    results
+    |> Enum.map(fn entry ->
+      comparison_map =
+        if entry[:comparison] do
+          comparison =
+            build_map(metrics, entry.comparison.metrics)
+            |> Map.put(:change, build_map(metrics, entry.comparison.change))
 
-  defp do_group_by(q, "visit:entry_page") do
-    from(
-      s in q,
-      group_by: s.entry_page,
-      select_merge: %{"entry_page" => s.entry_page}
-    )
-  end
+          %{comparison: comparison}
+        else
+          %{}
+        end
 
-  defp do_group_by(q, "visit:exit_page") do
-    from(
-      s in q,
-      group_by: s.exit_page,
-      select_merge: %{"exit_page" => s.exit_page}
-    )
-  end
-
-  defp do_group_by(q, "visit:referrer") do
-    from(
-      s in q,
-      group_by: s.referrer,
-      select_merge: %{
-        "referrer" => fragment("if(empty(?), ?, ?)", s.referrer, @no_ref, s.referrer)
-      }
-    )
-  end
-
-  defp do_group_by(q, "visit:utm_medium") do
-    from(
-      s in q,
-      group_by: s.utm_medium,
-      select_merge: %{
-        "utm_medium" => fragment("if(empty(?), ?, ?)", s.utm_medium, @no_ref, s.utm_medium)
-      }
-    )
-  end
-
-  defp do_group_by(q, "visit:utm_source") do
-    from(
-      s in q,
-      group_by: s.utm_source,
-      select_merge: %{
-        "utm_source" => fragment("if(empty(?), ?, ?)", s.utm_source, @no_ref, s.utm_source)
-      }
-    )
-  end
-
-  defp do_group_by(q, "visit:utm_campaign") do
-    from(
-      s in q,
-      group_by: s.utm_campaign,
-      select_merge: %{
-        "utm_campaign" => fragment("if(empty(?), ?, ?)", s.utm_campaign, @no_ref, s.utm_campaign)
-      }
-    )
-  end
-
-  defp do_group_by(q, "visit:device") do
-    from(
-      s in q,
-      group_by: s.screen_size,
-      select_merge: %{"device" => s.screen_size}
-    )
-  end
-
-  defp do_group_by(q, "visit:os") do
-    from(
-      s in q,
-      group_by: s.operating_system,
-      select_merge: %{"os" => s.operating_system}
-    )
-  end
-
-  defp do_group_by(q, "visit:os_version") do
-    from(
-      s in q,
-      group_by: s.operating_system_version,
-      select_merge: %{"os_version" => s.operating_system_version}
-    )
-  end
-
-  defp do_group_by(q, "visit:browser") do
-    from(
-      s in q,
-      group_by: s.browser,
-      select_merge: %{"browser" => s.browser}
-    )
-  end
-
-  defp do_group_by(q, "visit:browser_version") do
-    from(
-      s in q,
-      group_by: s.browser_version,
-      select_merge: %{"browser_version" => s.browser_version}
-    )
-  end
-
-  defp transform_keys(results, keys_to_replace) do
-    Enum.map(results, fn map ->
-      Enum.map(map, fn {key, val} ->
-        {Map.get(keys_to_replace, key, key), val}
-      end)
-      |> Enum.into(%{})
+      build_map(dimension_keys, entry.dimensions)
+      |> Map.merge(build_map(metrics, entry.metrics))
+      |> Map.merge(comparison_map)
     end)
+  end
+
+  defp build_map(keys, values) do
+    Enum.zip(keys, values) |> Map.new()
+  end
+
+  defp result_key("event:props:" <> custom_property), do: custom_property
+  defp result_key("event:" <> key), do: key |> String.to_existing_atom()
+  defp result_key("visit:" <> key), do: key |> String.to_existing_atom()
+  defp result_key(dimension), do: dimension
+
+  defp maybe_remap_to_group_conversion_rate(metric, dimension) do
+    case {metric, dimension} do
+      {:conversion_rate, "event:props:" <> _} -> :conversion_rate
+      {:conversion_rate, "event:goal"} -> :conversion_rate
+      {:conversion_rate, _} -> :group_conversion_rate
+      _ -> metric
+    end
+  end
+
+  defp transform_metrics(metrics, dimension) do
+    metrics =
+      if is_nil(metric_to_order_by(metrics)) do
+        metrics ++ [:visitors]
+      else
+        metrics
+      end
+
+    Enum.map(metrics, fn metric -> maybe_remap_to_group_conversion_rate(metric, dimension) end)
+  end
+
+  defp transform_order_by(order_by, dimension) do
+    Enum.map(order_by, fn {metric, direction} ->
+      {maybe_remap_to_group_conversion_rate(metric, dimension), direction}
+    end)
+  end
+
+  defp infer_order_by(metrics, "event:goal"),
+    do: [{metric_to_order_by(metrics), :desc}]
+
+  defp infer_order_by(metrics, dimension),
+    do: [{metric_to_order_by(metrics), :desc}, {dimension, :asc}]
+
+  defp metric_to_order_by(metrics) do
+    Enum.find(metrics, &(&1 != :time_on_page))
+  end
+
+  def transform_dimensions("visit:browser_version"),
+    do: ["visit:browser", "visit:browser_version"]
+
+  def transform_dimensions("visit:os_version"), do: ["visit:os", "visit:os_version"]
+  def transform_dimensions(dimension), do: [dimension]
+
+  @filter_dimensions_not %{
+    "visit:city" => [0],
+    "visit:country" => ["\0\0", "ZZ"],
+    "visit:region" => [""],
+    "visit:utm_medium" => [""],
+    "visit:utm_source" => [""],
+    "visit:utm_campaign" => [""],
+    "visit:utm_content" => [""],
+    "visit:utm_term" => [""],
+    "visit:entry_page" => [""],
+    "visit:exit_page" => [""]
+  }
+
+  @extra_filter_dimensions Map.keys(@filter_dimensions_not)
+
+  defp dimension_filters(dimension) when dimension in @extra_filter_dimensions do
+    [[:is_not, dimension, Map.get(@filter_dimensions_not, dimension)]]
+  end
+
+  defp dimension_filters(_), do: []
+
+  defp format_date_range(%Query{} = query) do
+    year = query.now.year
+    %Date.Range{first: first, last: last} = Query.date_range(query, trim_trailing: true)
+
+    cond do
+      first == last ->
+        strfdate(first, first.year != year)
+
+      first.year == last.year ->
+        "#{strfdate(first, false)} - #{strfdate(last, year != last.year)}"
+
+      true ->
+        "#{strfdate(first, true)} - #{strfdate(last, true)}"
+    end
+  end
+
+  defp strfdate(date, true = _include_year) do
+    Calendar.strftime(date, "%-d %b %Y")
+  end
+
+  defp strfdate(date, false = _include_year) do
+    Calendar.strftime(date, "%-d %b")
   end
 end

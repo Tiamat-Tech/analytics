@@ -1,178 +1,355 @@
 defmodule PlausibleWeb.Site.InvitationControllerTest do
-  use PlausibleWeb.ConnCase
+  use PlausibleWeb.ConnCase, async: true
   use Plausible.Repo
+  use Plausible.Teams.Test
   use Bamboo.Test
-  import Plausible.TestUtils
+
+  alias Plausible.Teams
 
   setup [:create_user, :log_in]
 
   describe "POST /sites/invitations/:invitation_id/accept" do
     test "converts the invitation into a membership", %{conn: conn, user: user} do
-      site = insert(:site)
+      owner = new_user()
+      site = new_site(owner: owner)
 
       invitation =
-        insert(:invitation,
-          site_id: site.id,
-          inviter: build(:user),
-          email: user.email,
-          role: :admin
-        )
+        invite_guest(site, user.email, inviter: owner, role: :editor)
 
-      post(conn, "/sites/invitations/#{invitation.invitation_id}/accept")
+      conn = post(conn, "/sites/invitations/#{invitation.invitation_id}/accept")
 
-      refute Repo.exists?(from(i in Plausible.Auth.Invitation, where: i.email == ^user.email))
+      assert Phoenix.Flash.get(conn.assigns.flash, :success) ==
+               "You now have access to #{site.domain}"
 
-      membership = Repo.get_by(Plausible.Site.Membership, user_id: user.id, site_id: site.id)
-      assert membership.role == :admin
+      assert redirected_to(conn) == "/#{URI.encode_www_form(site.domain)}"
+
+      refute Repo.exists?(from(i in Plausible.Teams.Invitation, where: i.email == ^user.email))
+
+      assert_guest_membership(site.team, site, user, :editor)
     end
 
-    test "notifies the original inviter", %{conn: conn, user: user} do
-      inviter = insert(:user)
-      site = insert(:site)
+    test "converts the team invitation into a team membership", %{conn: conn, user: user} do
+      owner = new_user()
+      _site = new_site(owner: owner)
+      team = team_of(owner)
 
       invitation =
-        insert(:invitation, site_id: site.id, inviter: inviter, email: user.email, role: :admin)
+        invite_member(team, user.email, inviter: owner, role: :editor)
 
-      post(conn, "/sites/invitations/#{invitation.invitation_id}/accept")
+      conn = post(conn, "/settings/team/invitations/#{invitation.invitation_id}/accept")
 
-      assert_email_delivered_with(
-        to: [nil: inviter.email],
-        subject: "[Plausible Analytics] #{user.email} accepted your invitation to #{site.domain}"
-      )
+      assert Phoenix.Flash.get(conn.assigns.flash, :success) ==
+               "You now have access to \"#{team.name}\" team"
+
+      assert redirected_to(conn) == "/sites"
+
+      refute Repo.get_by(Teams.Invitation, email: user.email)
+
+      assert_team_membership(user, team, :editor)
     end
 
-    test "ownership transfer - notifies the original inviter with a different email", %{
-      conn: conn,
-      user: user
-    } do
-      inviter = insert(:user)
-      site = insert(:site)
+    test "does not crash if clicked for the 2nd time in another tab", %{conn: conn, user: user} do
+      owner = new_user()
+      site = new_site(owner: owner)
+      invitation = invite_guest(site, user.email, role: :editor, inviter: owner)
 
-      invitation =
-        insert(:invitation, site_id: site.id, inviter: inviter, email: user.email, role: :owner)
+      c1 = post(conn, "/sites/invitations/#{invitation.invitation_id}/accept")
+      assert redirected_to(c1) == "/#{URI.encode_www_form(site.domain)}"
 
-      post(conn, "/sites/invitations/#{invitation.invitation_id}/accept")
+      assert Phoenix.Flash.get(c1.assigns.flash, :success) ==
+               "You now have access to #{site.domain}"
 
-      assert_email_delivered_with(
-        to: [nil: inviter.email],
-        subject:
-          "[Plausible Analytics] #{user.email} accepted the ownership transfer of #{site.domain}"
-      )
+      c2 = post(conn, "/sites/invitations/#{invitation.invitation_id}/accept")
+      assert redirected_to(c2) == "/sites"
+
+      assert Phoenix.Flash.get(c2.assigns.flash, :error) ==
+               "Invitation missing or already accepted"
+    end
+  end
+
+  describe "POST /sites/invitations/:invitation_id/accept - ownership transfer" do
+    test "downgrades previous owner to admin", %{conn: conn, user: user} do
+      old_owner = new_user()
+      site = new_site(owner: old_owner)
+
+      subscribe_to_growth_plan(user)
+      new_team = team_of(user)
+
+      transfer = invite_transfer(site, user, inviter: old_owner)
+
+      conn = post(conn, "/sites/invitations/#{transfer.transfer_id}/accept")
+
+      assert redirected_to(conn, 302) == "/#{URI.encode_www_form(site.domain)}"
+
+      assert Phoenix.Flash.get(conn.assigns.flash, :success) =~
+               "You now have access to"
+
+      refute Repo.reload(transfer)
+
+      assert_guest_membership(new_team, site, old_owner, :editor)
+
+      assert_team_attached(site, new_team.id)
     end
 
-    test "ownership transfer - downgrades previous owner to admin", %{conn: conn, user: user} do
-      old_owner = insert(:user)
-      site = insert(:site, members: [old_owner])
+    @tag :ee_only
+    test "fails when new owner has no plan", %{conn: conn, user: user} do
+      old_owner = new_user()
+      site = new_site(owner: old_owner)
 
-      invitation =
-        insert(:invitation, site_id: site.id, inviter: old_owner, email: user.email, role: :owner)
+      transfer = invite_transfer(site, user, inviter: old_owner)
 
-      post(conn, "/sites/invitations/#{invitation.invitation_id}/accept")
+      conn = post(conn, "/sites/invitations/#{transfer.transfer_id}/accept")
 
-      refute Repo.exists?(from(i in Plausible.Auth.Invitation, where: i.email == ^user.email))
+      assert redirected_to(conn, 302) == Routes.site_path(conn, :index)
 
-      old_owner_membership =
-        Repo.get_by(Plausible.Site.Membership, user_id: old_owner.id, site_id: site.id)
-
-      assert old_owner_membership.role == :admin
-
-      new_owner_membership =
-        Repo.get_by(Plausible.Site.Membership, user_id: user.id, site_id: site.id)
-
-      assert new_owner_membership.role == :owner
+      assert Phoenix.Flash.get(conn.assigns.flash, :error) =~
+               "No existing subscription"
     end
 
-    test "ownership transfer - will lock the site if new owner does not have an active subscription or trial",
-         %{
-           conn: conn,
-           user: user
-         } do
-      Repo.update_all(from(u in Plausible.Auth.User, where: u.id == ^user.id),
-        set: [trial_expiry_date: Timex.today() |> Timex.shift(days: -1)]
-      )
+    @tag :ee_only
+    test "fails when new owner's plan is unsuitable", %{conn: conn, user: user} do
+      old_owner = new_user()
+      site = new_site(owner: old_owner)
 
-      inviter = insert(:user)
-      site = insert(:site, locked: false)
+      subscribe_to_growth_plan(user)
 
-      invitation =
-        insert(:invitation, site_id: site.id, inviter: inviter, email: user.email, role: :owner)
+      # fill site limit quota
+      for _ <- 1..10, do: new_site(owner: user)
 
-      post(conn, "/sites/invitations/#{invitation.invitation_id}/accept")
+      transfer = invite_transfer(site, user, inviter: old_owner)
 
-      assert Repo.reload!(site).locked
-    end
+      conn = post(conn, "/sites/invitations/#{transfer.transfer_id}/accept")
 
-    test "ownership transfer - will end the trial of the new owner immediately", %{
-      conn: conn,
-      user: user
-    } do
-      Repo.update_all(from(u in Plausible.Auth.User, where: u.id == ^user.id),
-        set: [trial_expiry_date: Timex.today() |> Timex.shift(days: 7)]
-      )
+      assert redirected_to(conn, 302) == Routes.site_path(conn, :index)
 
-      inviter = insert(:user)
-      site = insert(:site, locked: false)
-
-      invitation =
-        insert(:invitation, site_id: site.id, inviter: inviter, email: user.email, role: :owner)
-
-      post(conn, "/sites/invitations/#{invitation.invitation_id}/accept")
-
-      assert Timex.before?(Repo.reload!(user).trial_expiry_date, Timex.today())
-      assert Repo.reload!(site).locked
+      assert Phoenix.Flash.get(conn.assigns.flash, :error) =~
+               "Plan limits exceeded: site limit."
     end
   end
 
   describe "POST /sites/invitations/:invitation_id/reject" do
-    test "deletes the invitation", %{conn: conn, user: user} do
-      site = insert(:site)
+    test "rejects the invitation", %{conn: conn, user: user} do
+      owner = new_user()
+      site = new_site(owner: owner)
 
-      invitation =
-        insert(:invitation,
-          site_id: site.id,
-          inviter: build(:user),
-          email: user.email,
-          role: :admin
-        )
+      invitation = invite_guest(site, user.email, inviter: owner, role: :editor)
 
-      post(conn, "/sites/invitations/#{invitation.invitation_id}/reject")
+      conn = post(conn, "/sites/invitations/#{invitation.invitation_id}/reject")
 
-      refute Repo.exists?(from(i in Plausible.Auth.Invitation, where: i.email == ^user.email))
+      assert redirected_to(conn, 302) == "/sites"
+
+      refute Repo.reload(invitation)
     end
 
-    test "notifies the original inviter", %{conn: conn, user: user} do
-      inviter = insert(:user)
-      site = insert(:site)
+    test "rejects the team invitation", %{conn: conn, user: user} do
+      owner = new_user()
+      _site = new_site(owner: owner)
+      team = team_of(owner)
 
-      invitation =
-        insert(:invitation, site_id: site.id, inviter: inviter, email: user.email, role: :admin)
+      invitation = invite_member(team, user.email, inviter: owner, role: :editor)
 
-      post(conn, "/sites/invitations/#{invitation.invitation_id}/reject")
+      conn = post(conn, "/settings/team/invitations/#{invitation.invitation_id}/reject")
 
-      assert_email_delivered_with(
-        to: [nil: inviter.email],
-        subject: "[Plausible Analytics] #{user.email} rejected your invitation to #{site.domain}"
-      )
+      assert redirected_to(conn, 302) == "/sites"
+
+      refute Repo.reload(invitation)
+    end
+
+    test "renders error for non-existent invitation", %{conn: conn} do
+      conn = post(conn, "/sites/invitations/does-not-exist/reject")
+
+      assert redirected_to(conn, 302) == "/sites"
+
+      assert Phoenix.Flash.get(conn.assigns.flash, :error) ==
+               "Invitation missing or already accepted"
     end
   end
 
-  describe "DELETE /sites/invitations/:invitation_id" do
-    test "removes the invitation", %{conn: conn} do
-      site = insert(:site)
+  describe "DELETE /sites/:domain/invitations/:invitation_id" do
+    test "removes the invitation", %{conn: conn, user: user} do
+      owner = new_user()
+      site = new_site(owner: owner)
+      add_guest(site, user: user, role: :editor)
+      invitation = invite_guest(site, "jane@example.com", inviter: owner, role: :editor)
 
-      invitation =
-        insert(:invitation,
-          site_id: site.id,
-          inviter: build(:user),
-          email: "jane@example.com",
-          role: :admin
+      conn =
+        delete(
+          conn,
+          Routes.invitation_path(conn, :remove_invitation, site.domain, invitation.invitation_id)
         )
 
-      delete(conn, "/sites/invitations/#{invitation.invitation_id}")
+      assert redirected_to(conn, 302) == "/#{URI.encode_www_form(site.domain)}/settings/people"
 
-      refute Repo.exists?(
-               from i in Plausible.Auth.Invitation, where: i.email == "jane@example.com"
-             )
+      refute Repo.reload(invitation)
+    end
+
+    test "removes the invitation for ownership transfer", %{conn: conn, user: user} do
+      owner = new_user()
+      site = new_site(owner: owner)
+      add_guest(site, user: user, role: :editor)
+      transfer = invite_transfer(site, "jane@example.com", inviter: owner)
+
+      conn =
+        delete(
+          conn,
+          Routes.invitation_path(conn, :remove_invitation, site.domain, transfer.transfer_id)
+        )
+
+      assert redirected_to(conn, 302) == "/#{URI.encode_www_form(site.domain)}/settings/people"
+
+      refute Repo.reload(transfer)
+    end
+
+    test "fails to remove an invitation with insufficient permission", %{conn: conn, user: user} do
+      owner = new_user()
+      site = new_site(owner: owner)
+      add_guest(site, user: user, role: :viewer)
+
+      invitation = invite_guest(site, "jane@example.com", inviter: owner, role: :editor)
+
+      delete(
+        conn,
+        Routes.invitation_path(conn, :remove_invitation, site.domain, invitation.invitation_id)
+      )
+
+      assert Repo.reload(invitation)
+    end
+
+    test "fails to remove an invitation from the outside", %{conn: my_conn, user: me} do
+      new_site(owner: me)
+
+      other_user = new_user()
+
+      other_site = new_site(owner: other_user)
+
+      invitation =
+        invite_guest(other_site, "jane@example.com", role: :editor, inviter: other_user)
+
+      remove_invitation_path =
+        Routes.invitation_path(
+          my_conn,
+          :remove_invitation,
+          other_site.domain,
+          invitation.invitation_id
+        )
+
+      delete(my_conn, remove_invitation_path)
+
+      assert Repo.reload(invitation)
+    end
+
+    test "renders error for non-existent invitation", %{conn: conn, user: user} do
+      site = new_site()
+      add_guest(site, user: user, role: :editor)
+
+      remove_invitation_path =
+        Routes.invitation_path(
+          conn,
+          :remove_invitation,
+          site.domain,
+          "does_not_exist"
+        )
+
+      conn = delete(conn, remove_invitation_path)
+
+      assert redirected_to(conn, 302) == "/#{URI.encode_www_form(site.domain)}/settings/people"
+
+      assert Phoenix.Flash.get(conn.assigns.flash, :error) ==
+               "Invitation missing or already removed"
+    end
+  end
+
+  describe "DELETE /team/invitations/:invitation_id" do
+    for role <- [:owner, :admin], invitee_role <- Teams.Membership.roles() do
+      test "#{role} removes the #{invitee_role} team invitation", %{conn: conn, user: user} do
+        owner = new_user()
+        _site = new_site(owner: owner)
+        team = team_of(owner)
+        add_member(team, user: user, role: unquote(role))
+
+        invitation =
+          invite_member(team, "jane@example.com", inviter: owner, role: unquote(invitee_role))
+
+        conn =
+          delete(
+            conn,
+            Routes.invitation_path(conn, :remove_team_invitation, invitation.invitation_id)
+          )
+
+        assert redirected_to(conn, 302) == "/settings/team/general"
+
+        refute Repo.reload(invitation)
+      end
+    end
+
+    for role <- Teams.Membership.roles() -- [:owner, :admin] do
+      test "#{role} can't remove a team invitation", %{conn: conn, user: user} do
+        owner = new_user()
+        _site = new_site(owner: owner)
+        team = team_of(owner)
+        add_member(team, user: user, role: unquote(role))
+
+        invitation =
+          invite_member(team, "jane@example.com", inviter: owner, role: :viewer)
+
+        conn =
+          delete(
+            conn,
+            Routes.invitation_path(conn, :remove_team_invitation, invitation.invitation_id)
+          )
+
+        assert redirected_to(conn, 302) == "/settings/team/general"
+
+        assert Phoenix.Flash.get(conn.assigns.flash, :error) ==
+                 "You are not allowed to remove invitations"
+
+        assert Repo.reload(invitation)
+      end
+    end
+
+    test "fails to remove a team invitation from the outside", %{conn: my_conn, user: me} do
+      new_site(owner: me)
+      other_user = new_user()
+      _other_site = new_site(owner: other_user)
+      other_team = team_of(other_user)
+
+      invitation =
+        invite_member(other_team, "jane@example.com", role: :editor, inviter: other_user)
+
+      remove_invitation_path =
+        Routes.invitation_path(
+          my_conn,
+          :remove_team_invitation,
+          invitation.invitation_id
+        )
+
+      my_conn = delete(my_conn, remove_invitation_path)
+
+      assert Phoenix.Flash.get(my_conn.assigns.flash, :error) ==
+               "Invitation missing or already removed"
+
+      assert Repo.reload(invitation)
+    end
+
+    test "renders error for non-existent team invitation", %{conn: conn, user: user} do
+      owner = new_user()
+      _site = new_site(owner: owner)
+      team = team_of(owner)
+      add_member(team, user: user, role: :editor)
+
+      remove_invitation_path =
+        Routes.invitation_path(
+          conn,
+          :remove_team_invitation,
+          "does_not_exist"
+        )
+
+      conn = delete(conn, remove_invitation_path)
+
+      assert redirected_to(conn, 302) == "/settings/team/general"
+
+      assert Phoenix.Flash.get(conn.assigns.flash, :error) ==
+               "Invitation missing or already removed"
     end
   end
 end

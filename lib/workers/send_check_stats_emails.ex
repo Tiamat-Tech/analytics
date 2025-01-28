@@ -12,14 +12,11 @@ defmodule Plausible.Workers.SendCheckStatsEmails do
         where:
           u.inserted_at > fragment("(now() at time zone 'utc') - '14 days'::interval") and
             u.inserted_at < fragment("(now() at time zone 'utc') - '7 days'::interval") and
-            u.last_seen < fragment("(now() at time zone 'utc') - '7 days'::interval"),
-        preload: [sites: :weekly_report]
+            u.last_seen < fragment("(now() at time zone 'utc') - '7 days'::interval")
       )
 
     for user <- Repo.all(q) do
-      enabled_report = Enum.any?(user.sites, fn site -> site.weekly_report end)
-
-      if Plausible.Auth.has_active_sites?(user) && !enabled_report do
+      if eligible_for_check_stats_email?(user) do
         send_check_stats_email(user)
       end
     end
@@ -27,9 +24,26 @@ defmodule Plausible.Workers.SendCheckStatsEmails do
     :ok
   end
 
+  defp eligible_for_check_stats_email?(user) do
+    sites =
+      from(tm in Plausible.Teams.Membership,
+        inner_join: t in assoc(tm, :team),
+        inner_join: s in assoc(t, :sites),
+        left_join: gm in assoc(tm, :guest_memberships),
+        where: tm.user_id == ^user.id,
+        where: tm.role != :guest or gm.site_id == s.id,
+        select: s
+      )
+      |> Repo.all()
+      |> Repo.preload(:weekly_report)
+
+    not Enum.any?(sites, fn site -> site.weekly_report end) and
+      Enum.any?(sites, &Plausible.Sites.has_stats?/1)
+  end
+
   defp send_check_stats_email(user) do
     PlausibleWeb.Email.check_stats_email(user)
-    |> Plausible.Mailer.send_email()
+    |> Plausible.Mailer.send()
 
     Repo.insert_all("check_stats_emails", [
       %{

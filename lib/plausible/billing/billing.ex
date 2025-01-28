@@ -1,37 +1,95 @@
 defmodule Plausible.Billing do
+  use Plausible
   use Plausible.Repo
-  alias Plausible.Billing.{Subscription, PaddleApi}
-  use Plausible.ClickhouseRepo
-
-  def active_subscription_for(user_id) do
-    Repo.get_by(Subscription, user_id: user_id, status: "active")
-  end
+  require Plausible.Billing.Subscription.Status
+  alias Plausible.Auth
+  alias Plausible.Billing.Subscription
+  alias Plausible.Teams
 
   def subscription_created(params) do
-    params =
-      if present?(params["passthrough"]) do
-        params
-      else
-        user = Repo.get_by(Plausible.Auth.User, email: params["email"])
-        Map.put(params, "passthrough", user && user.id)
-      end
-
-    changeset = Subscription.changeset(%Subscription{}, format_subscription(params))
-
-    Repo.insert(changeset) |> check_lock_status
+    Repo.transaction(fn ->
+      handle_subscription_created(params)
+    end)
   end
 
   def subscription_updated(params) do
-    subscription = Repo.get_by!(Subscription, paddle_subscription_id: params["subscription_id"])
-    changeset = Subscription.changeset(subscription, format_subscription(params))
-
-    Repo.update(changeset) |> check_lock_status
+    Repo.transaction(fn ->
+      handle_subscription_updated(params)
+    end)
   end
 
   def subscription_cancelled(params) do
+    Repo.transaction(fn ->
+      handle_subscription_cancelled(params)
+    end)
+  end
+
+  def subscription_payment_succeeded(params) do
+    Repo.transaction(fn ->
+      handle_subscription_payment_succeeded(params)
+    end)
+  end
+
+  def change_plan_preview(subscription, new_plan_id) do
+    case paddle_api().update_subscription_preview(
+           subscription.paddle_subscription_id,
+           new_plan_id
+         ) do
+      {:ok, response} ->
+        {:ok, response}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp handle_subscription_created(params) do
+    team = get_team!(params)
+
+    subscription_params =
+      params
+      |> format_subscription()
+      |> add_last_bill_date(params)
+
+    team
+    |> Subscription.create_changeset(subscription_params)
+    |> Repo.insert!()
+    |> after_subscription_update()
+  end
+
+  defp handle_subscription_updated(params) do
+    subscription = Repo.get_by(Subscription, paddle_subscription_id: params["subscription_id"])
+
+    # In a situation where the subscription is paused and a payment succeeds, we
+    # get notified of two "subscription_updated" webhook alerts from Paddle at the
+    # same time.
+    #
+    #   * one with an `old_status` of "paused", and a `status` of "past_due"
+    #   * the other with an `old_status` of "past_due", and a `status` of "active"
+    #
+    # https://developer.paddle.com/classic/guides/zg9joji1mzu0mduy-payment-failures
+    #
+    # Relying on the time when the webhooks are sent has caused issues where
+    # subscriptions have ended up `past_due` after a successful payment. Therefore,
+    # we're now explicitly ignoring the first webhook (with the update that's not
+    # relevant to us).
+    irrelevant? = params["old_status"] == "paused" && params["status"] == "past_due"
+
+    if subscription && not irrelevant? do
+      params = format_subscription(params)
+
+      subscription
+      |> Subscription.changeset(params)
+      |> Repo.update!()
+      |> after_subscription_update()
+    end
+  end
+
+  defp handle_subscription_cancelled(params) do
     subscription =
-      Repo.get_by(Subscription, paddle_subscription_id: params["subscription_id"])
-      |> Repo.preload(:user)
+      Subscription
+      |> Repo.get_by(paddle_subscription_id: params["subscription_id"])
+      |> Repo.preload(team: :owner)
 
     if subscription do
       changeset =
@@ -39,22 +97,17 @@ defmodule Plausible.Billing do
           status: params["status"]
         })
 
-      case Repo.update(changeset) do
-        {:ok, updated} ->
-          PlausibleWeb.Email.cancellation_email(subscription.user)
-          |> Plausible.Mailer.send_email()
+      updated = Repo.update!(changeset)
 
-          {:ok, updated}
+      subscription.team.owner
+      |> PlausibleWeb.Email.cancellation_email()
+      |> Plausible.Mailer.send()
 
-        err ->
-          err
-      end
-    else
-      {:ok, nil}
+      updated
     end
   end
 
-  def subscription_payment_succeeded(params) do
+  defp handle_subscription_payment_succeeded(params) do
     subscription = Repo.get_by(Subscription, paddle_subscription_id: params["subscription_id"])
 
     if subscription do
@@ -63,147 +116,60 @@ defmodule Plausible.Billing do
       amount =
         :erlang.float_to_binary(api_subscription["next_payment"]["amount"] / 1, decimals: 2)
 
-      changeset =
-        Subscription.changeset(subscription, %{
+      subscription =
+        subscription
+        |> Subscription.changeset(%{
           next_bill_amount: amount,
           next_bill_date: api_subscription["next_payment"]["date"],
           last_bill_date: api_subscription["last_payment"]["date"]
         })
+        |> Repo.update!()
+        |> Repo.preload(:team)
 
-      Repo.update(changeset)
-    else
-      {:ok, nil}
+      Plausible.Teams.update_accept_traffic_until(subscription.team)
+
+      subscription
     end
   end
 
-  def change_plan(user, new_plan_id) do
-    subscription = active_subscription_for(user.id)
+  defp get_team!(%{"passthrough" => passthrough}) do
+    case parse_passthrough!(passthrough) do
+      {:team_id, team_id} ->
+        Teams.get!(team_id)
 
-    res =
-      paddle_api().update_subscription(subscription.paddle_subscription_id, %{
-        plan_id: new_plan_id
-      })
-
-    case res do
-      {:ok, response} ->
-        amount = :erlang.float_to_binary(response["next_payment"]["amount"] / 1, decimals: 2)
-
-        Subscription.changeset(subscription, %{
-          paddle_plan_id: Integer.to_string(response["plan_id"]),
-          next_bill_amount: amount,
-          next_bill_date: response["next_payment"]["date"]
-        })
-        |> Repo.update()
-
-      e ->
-        e
+      {:user_id, user_id} ->
+        user = Repo.get!(Auth.User, user_id)
+        {:ok, team} = Teams.get_or_create(user)
+        team
     end
   end
 
-  def change_plan_preview(subscription, new_plan_id) do
-    PaddleApi.update_subscription_preview(subscription.paddle_subscription_id, new_plan_id)
+  defp get_team!(_params) do
+    raise "Missing passthrough"
   end
 
-  def needs_to_upgrade?(%Plausible.Auth.User{trial_expiry_date: nil}), do: true
+  defp parse_passthrough!(passthrough) do
+    {user_id, team_id} =
+      case String.split(to_string(passthrough), ";") do
+        ["ee:true", "user:" <> user_id, "team:" <> team_id] ->
+          {user_id, team_id}
 
-  def needs_to_upgrade?(user) do
-    if Timex.before?(user.trial_expiry_date, Timex.today()) do
-      !subscription_is_active?(user.subscription)
-    else
-      false
-    end
-  end
+        ["ee:true", "user:" <> user_id] ->
+          {user_id, "0"}
 
-  defp subscription_is_active?(%Subscription{status: "active"}), do: true
-  defp subscription_is_active?(%Subscription{status: "past_due"}), do: true
+        _ ->
+          raise "Invalid passthrough sent via Paddle: #{inspect(passthrough)}"
+      end
 
-  defp subscription_is_active?(%Subscription{status: "deleted"} = subscription) do
-    subscription.next_bill_date && !Timex.before?(subscription.next_bill_date, Timex.today())
-  end
+    case {Integer.parse(user_id), Integer.parse(team_id)} do
+      {{user_id, ""}, {0, ""}} when user_id > 0 ->
+        {:user_id, user_id}
 
-  defp subscription_is_active?(%Subscription{}), do: false
-  defp subscription_is_active?(nil), do: false
+      {{_user_id, ""}, {team_id, ""}} when team_id > 0 ->
+        {:team_id, team_id}
 
-  def on_trial?(%Plausible.Auth.User{trial_expiry_date: nil}), do: false
-
-  def on_trial?(user) do
-    !subscription_is_active?(user.subscription) && trial_days_left(user) >= 0
-  end
-
-  def trial_days_left(user) do
-    Timex.diff(user.trial_expiry_date, Timex.today(), :days)
-  end
-
-  def usage(user) do
-    {pageviews, custom_events} = usage_breakdown(user)
-    pageviews + custom_events
-  end
-
-  defp get_usage_for_billing_cycle(sites, cycle) do
-    domains = Enum.map(sites, & &1.domain)
-
-    ClickhouseRepo.one(
-      from e in "events",
-        where: e.domain in ^domains,
-        where: fragment("toDate(?)", e.timestamp) >= ^cycle.first,
-        where: fragment("toDate(?)", e.timestamp) <= ^cycle.last,
-        select: fragment("count(*)")
-    )
-  end
-
-  def last_two_billing_months_usage(user, today \\ Timex.today()) do
-    {first, second} = last_two_billing_cycles(user, today)
-    sites = Plausible.Sites.owned_by(user)
-
-    {
-      get_usage_for_billing_cycle(sites, first),
-      get_usage_for_billing_cycle(sites, second)
-    }
-  end
-
-  def last_two_billing_cycles(user, today \\ Timex.today()) do
-    last_bill_date = user.subscription.last_bill_date
-
-    normalized_last_bill_date =
-      Timex.shift(last_bill_date,
-        months: Timex.diff(today, last_bill_date, :months)
-      )
-
-    {
-      Date.range(
-        Timex.shift(normalized_last_bill_date, months: -2),
-        Timex.shift(normalized_last_bill_date, days: -1, months: -1)
-      ),
-      Date.range(
-        Timex.shift(normalized_last_bill_date, months: -1),
-        Timex.shift(normalized_last_bill_date, days: -1)
-      )
-    }
-  end
-
-  def usage_breakdown(user) do
-    sites = Plausible.Sites.owned_by(user)
-
-    Enum.reduce(sites, {0, 0}, fn site, {pageviews, custom_events} ->
-      usage = Plausible.Stats.Clickhouse.usage(site)
-
-      {pageviews + Map.get(usage, "pageviews", 0),
-       custom_events + Map.get(usage, "custom_events", 0)}
-    end)
-  end
-
-  @doc """
-  Returns the number of sites that an account is allowed to have. Accounts for
-  grandfathering old accounts to unlimited websites and ignores site limit on self-hosted
-  installations.
-  """
-  @limit_accounts_since ~D[2021-05-05]
-  def sites_limit(user) do
-    cond do
-      Timex.before?(user.inserted_at, @limit_accounts_since) -> nil
-      Application.get_env(:plausible, :is_selfhost) -> nil
-      user.email in Application.get_env(:plausible, :site_limit_exempt) -> nil
-      true -> Application.get_env(:plausible, :site_limit)
+      _ ->
+        raise "Invalid passthrough sent via Paddle: #{inspect(passthrough)}"
     end
   end
 
@@ -213,7 +179,6 @@ defmodule Plausible.Billing do
       paddle_plan_id: params["subscription_plan_id"],
       cancel_url: params["cancel_url"],
       update_url: params["update_url"],
-      user_id: params["passthrough"],
       status: params["status"],
       next_bill_date: params["next_bill_date"],
       next_bill_amount: params["unit_price"] || params["new_unit_price"],
@@ -221,20 +186,60 @@ defmodule Plausible.Billing do
     }
   end
 
-  defp present?(""), do: false
-  defp present?(nil), do: false
-  defp present?(_), do: true
-
-  defp check_lock_status({:ok, subscription}) do
-    user =
-      Repo.get(Plausible.Auth.User, subscription.user_id)
-      |> Map.put(:subscription, subscription)
-
-    Plausible.Billing.SiteLocker.check_sites_for(user)
-    {:ok, subscription}
+  defp add_last_bill_date(subscription_params, paddle_params) do
+    with datetime_str when is_binary(datetime_str) <- paddle_params["event_time"],
+         {:ok, datetime} <- NaiveDateTime.from_iso8601(datetime_str),
+         date <- NaiveDateTime.to_date(datetime) do
+      Map.put(subscription_params, :last_bill_date, date)
+    else
+      _ -> subscription_params
+    end
   end
 
-  defp check_lock_status(err), do: err
+  @spec format_price(Money.t()) :: String.t()
+  def format_price(money) do
+    Money.to_string!(money, fractional_digits: 2, no_fraction_if_integer: true)
+  end
 
-  defp paddle_api(), do: Application.fetch_env!(:plausible, :paddle_api)
+  def paddle_api(), do: Application.fetch_env!(:plausible, :paddle_api)
+
+  def cancelled_subscription_notice_dismiss_id(id) do
+    "subscription_cancelled__#{id}"
+  end
+
+  defp after_subscription_update(subscription) do
+    team =
+      Teams.Team
+      |> Repo.get!(subscription.team_id)
+      |> Teams.with_subscription()
+      |> Repo.preload(:owner)
+
+    if subscription.id != team.subscription.id do
+      Sentry.capture_message("Susbscription ID mismatch",
+        extra: %{subscription: inspect(subscription), team_id: team.id}
+      )
+    end
+
+    team
+    |> Plausible.Teams.update_accept_traffic_until()
+    |> Plausible.Teams.remove_grace_period()
+    |> Plausible.Teams.maybe_reset_next_upgrade_override()
+    |> tap(&Plausible.Billing.SiteLocker.update_sites_for/1)
+    |> maybe_adjust_api_key_limits()
+  end
+
+  defp maybe_adjust_api_key_limits(team) do
+    plan =
+      Repo.get_by(Plausible.Billing.EnterprisePlan,
+        team_id: team.id,
+        paddle_plan_id: team.subscription.paddle_plan_id
+      )
+
+    if plan do
+      api_keys = from(key in Plausible.Auth.ApiKey, where: key.user_id == ^team.owner.id)
+      Repo.update_all(api_keys, set: [hourly_request_limit: plan.hourly_api_request_limit])
+    end
+
+    team
+  end
 end

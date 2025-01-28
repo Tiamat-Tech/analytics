@@ -5,39 +5,43 @@ defmodule Plausible.Workers.SendTrialNotifications do
     queue: :trial_notification_emails,
     max_attempts: 1
 
+  alias Plausible.Teams
+
   require Logger
 
   @impl Oban.Worker
   def perform(_job) do
-    users =
+    teams =
       Repo.all(
-        from u in Plausible.Auth.User,
-          left_join: s in Plausible.Billing.Subscription,
-          on: s.user_id == u.id,
+        from t in Teams.Team,
+          inner_join: o in assoc(t, :owner),
+          left_join: s in assoc(t, :subscription),
+          where: not is_nil(t.trial_expiry_date),
           where: is_nil(s.id),
-          order_by: u.inserted_at
+          order_by: t.inserted_at,
+          preload: [owner: o]
       )
 
-    for user <- users do
-      case Timex.diff(user.trial_expiry_date, Timex.today(), :days) do
+    for team <- teams do
+      case Date.diff(team.trial_expiry_date, Date.utc_today()) do
         7 ->
-          if Plausible.Auth.has_active_sites?(user, [:owner]) do
-            send_one_week_reminder(user)
+          if Teams.has_active_sites?(team) do
+            send_one_week_reminder(team.owner)
           end
 
         1 ->
-          if Plausible.Auth.has_active_sites?(user, [:owner]) do
-            send_tomorrow_reminder(user)
+          if Teams.has_active_sites?(team) do
+            send_tomorrow_reminder(team.owner, team)
           end
 
         0 ->
-          if Plausible.Auth.has_active_sites?(user, [:owner]) do
-            send_today_reminder(user)
+          if Teams.has_active_sites?(team) do
+            send_today_reminder(team.owner, team)
           end
 
         -1 ->
-          if Plausible.Auth.has_active_sites?(user, [:owner]) do
-            send_over_reminder(user)
+          if Teams.has_active_sites?(team) do
+            send_over_reminder(team.owner)
           end
 
         _ ->
@@ -50,33 +54,25 @@ defmodule Plausible.Workers.SendTrialNotifications do
 
   defp send_one_week_reminder(user) do
     PlausibleWeb.Email.trial_one_week_reminder(user)
-    |> send_email()
+    |> Plausible.Mailer.send()
   end
 
-  defp send_tomorrow_reminder(user) do
-    usage = Plausible.Billing.usage_breakdown(user)
+  defp send_tomorrow_reminder(user, team) do
+    usage = Plausible.Teams.Billing.usage_cycle(team, :last_30_days)
 
     PlausibleWeb.Email.trial_upgrade_email(user, "tomorrow", usage)
-    |> send_email()
+    |> Plausible.Mailer.send()
   end
 
-  defp send_today_reminder(user) do
-    usage = Plausible.Billing.usage_breakdown(user)
+  defp send_today_reminder(user, team) do
+    usage = Plausible.Teams.Billing.usage_cycle(team, :last_30_days)
 
     PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
-    |> send_email()
+    |> Plausible.Mailer.send()
   end
 
   defp send_over_reminder(user) do
     PlausibleWeb.Email.trial_over_email(user)
-    |> send_email()
-  end
-
-  defp send_email(email) do
-    try do
-      Plausible.Mailer.send_email(email)
-    rescue
-      _ -> nil
-    end
+    |> Plausible.Mailer.send()
   end
 end
