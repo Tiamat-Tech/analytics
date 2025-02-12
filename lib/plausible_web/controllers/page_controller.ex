@@ -1,14 +1,15 @@
 defmodule PlausibleWeb.PageController do
   use PlausibleWeb, :controller
   use Plausible.Repo
-  plug PlausibleWeb.AutoAuthPlug
 
+  plug PlausibleWeb.RequireLoggedOutPlug
+
+  @doc """
+  The root path is never accessible in Plausible.Cloud because it is handled by the upstream reverse proxy.
+
+  This controller action is only ever triggered in self-hosted Plausible.
+  """
   def index(conn, _params) do
-    if conn.assigns[:current_user] do
-      user = conn.assigns[:current_user] |> Repo.preload(:sites)
-      render(conn, "sites.html", sites: user.sites)
-    else
-      render(conn, "index.html")
-    end
+    render(conn, "index.html")
   end
 end

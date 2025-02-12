@@ -1,5 +1,19 @@
 defmodule PlausibleWeb.ErrorView do
+  use Plausible
   use PlausibleWeb, :view
+
+  def render("500.json", %{conn: %{assigns: %{plugins_api: true}}}) do
+    contact_support_note =
+      on_ee do
+        "If the problem persists please contact support@plausible.io"
+      end
+
+    %{
+      errors: [
+        %{detail: "Internal server error, please try again. #{contact_support_note}"}
+      ]
+    }
+  end
 
   def render("500.json", _assigns) do
     %{
@@ -9,70 +23,63 @@ defmodule PlausibleWeb.ErrorView do
   end
 
   def render("404.html", assigns) do
-    render(
-      "error.html",
-      Map.merge(
-        %{
-          layout: false,
-          status: 404,
-          message: "Oops! There's nothing here"
-        },
-        assigns
-      )
-    )
+    assigns =
+      assigns
+      |> Map.put(:status, 404)
+      |> Map.put_new(:message, "Oops! There's nothing here")
+
+    render("404_error.html", assigns)
   end
 
-  def render("500.html", assigns) do
-    case Sentry.get_last_event_id_and_source() do
-      {event_id, :plug} when is_binary(event_id) ->
-        current_user = assigns[:current_user]
+  def render(<<"5", _error_5xx::binary-size(2), ".html">>, assigns) do
+    current_user = assigns[:current_user]
+    last_event = Sentry.get_last_event_id_and_source()
 
-        opts =
-          %{
-            eventId: event_id,
-            user: %{
-              name: current_user && current_user.name,
-              email: current_user && current_user.email
-            }
-          }
-          |> Jason.encode!()
+    case {current_user, last_event} do
+      {current_user, {event_id, :plug}}
+      when is_binary(event_id) and not is_nil(current_user) ->
+        opts = %{
+          trace_id: event_id,
+          user_name: current_user.name,
+          user_email: current_user.email
+        }
 
-        ~E"""
-        <script src="https://browser.sentry-cdn.com/5.9.1/bundle.min.js" integrity="sha384-/x1aHz0nKRd6zVUazsV6CbQvjJvr6zQL2CHbQZf3yoLkezyEtZUpqUNnOLW9Nt3v" crossorigin="anonymous"></script>
-        <script>
-        Sentry.init({ dsn: '<%= Sentry.Config.dsn() %>' });
-        Sentry.showReportDialog(<%= raw opts %>)
-        </script>
-        """
+        render("server_error.html", Map.merge(opts, assigns))
 
       _ ->
-        render(
-          "error.html",
-          Map.merge(
-            %{
-              layout: false,
-              status: 500,
-              message: "Oops! Looks like we're having server issues"
-            },
-            assigns
-          )
-        )
+        render("server_error.html", assigns)
     end
   end
 
   def template_not_found(template, assigns) do
-    status = String.trim_trailing(template, ".html")
-
-    render(
-      "error.html",
-      Map.merge(
-        %{
-          layout: false,
-          status: status,
-          message: Phoenix.Controller.status_message_from_template(template)
-        },
-        assigns
-      )
-    )
+    if String.ends_with?(template, ".json") do
+      fallback_json_error(template, assigns)
+    else
+      fallback_html_error(template, assigns)
+    end
   end
+
+  defp fallback_html_error(template, assigns) do
+    assigns =
+      assigns
+      |> Map.put_new(:message, Phoenix.Controller.status_message_from_template(template))
+      |> Map.put(:status, String.trim_trailing(template, ".html"))
+
+    render("generic_error.html", assigns)
+  end
+
+  defp fallback_json_error(template, _assigns) do
+    status =
+      String.split(template, ".")
+      |> hd()
+      |> String.to_integer()
+
+    message = Plug.Conn.Status.reason_phrase(status)
+    %{status: status, message: message}
+  rescue
+    _ -> %{status: 500, message: "Server error"}
+  end
+
+  defp url_path(%Plug.Conn{request_path: path, query_string: ""}), do: path
+  defp url_path(%Plug.Conn{request_path: path, query_string: query}), do: path <> "?" <> query
 end

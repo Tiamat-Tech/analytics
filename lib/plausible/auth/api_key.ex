@@ -1,13 +1,16 @@
 defmodule Plausible.Auth.ApiKey do
+  use Plausible
   use Ecto.Schema
   import Ecto.Changeset
+
+  @type t() :: %__MODULE__{}
 
   @required [:user_id, :name]
   @optional [:key, :scopes, :hourly_request_limit]
   schema "api_keys" do
     field :name, :string
     field :scopes, {:array, :string}, default: ["stats:read:*"]
-    field :hourly_request_limit, :integer, default: 1000
+    field :hourly_request_limit, :integer, default: on_ee(do: 600, else: 1_000_000)
 
     field :key, :string, virtual: true
     field :key_hash, :string
@@ -22,8 +25,9 @@ defmodule Plausible.Auth.ApiKey do
     schema
     |> cast(attrs, @required ++ @optional)
     |> validate_required(@required)
-    |> generate_key()
+    |> maybe_put_key()
     |> process_key()
+    |> unique_constraint(:key_hash, error_key: :key)
   end
 
   def update(schema, attrs \\ %{}) do
@@ -49,12 +53,12 @@ defmodule Plausible.Auth.ApiKey do
 
   def process_key(changeset), do: changeset
 
-  defp generate_key(changeset) do
-    if !changeset.changes[:key] do
-      key = :crypto.strong_rand_bytes(64) |> Base.url_encode64() |> binary_part(0, 64)
-      change(changeset, key: key)
-    else
+  defp maybe_put_key(changeset) do
+    if get_change(changeset, :key) do
       changeset
+    else
+      key = :crypto.strong_rand_bytes(64) |> Base.url_encode64() |> binary_part(0, 64)
+      put_change(changeset, :key, key)
     end
   end
 

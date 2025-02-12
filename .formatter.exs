@@ -1,5 +1,12 @@
 [
-  import_deps: [:ecto, :phoenix],
-  inputs: ["*.{ex,exs}", "priv/*/seeds.exs", "{config,lib,test}/**/*.{ex,exs}"],
-  subdirectories: ["priv/*/migrations"]
+  plugins: [Phoenix.LiveView.HTMLFormatter],
+  import_deps: [:ecto, :ecto_sql, :phoenix],
+  subdirectories: ["priv/*/migrations"],
+  inputs: [
+    "*.{heex,ex,exs}",
+    "{config,lib,test,extra}/**/*.{heex,ex,exs}",
+    "priv/*/seeds.exs",
+    "storybook/**/*.exs"
+  ],
+  locals_without_parens: [assert_matches: 1]
 ]

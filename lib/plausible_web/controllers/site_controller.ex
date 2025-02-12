@@ -1,278 +1,255 @@
 defmodule PlausibleWeb.SiteController do
   use PlausibleWeb, :controller
   use Plausible.Repo
-  alias Plausible.{Sites, Goals}
+  use Plausible
 
-  plug PlausibleWeb.RequireAccountPlug
+  alias Plausible.Sites
 
-  plug PlausibleWeb.AuthorizeSiteAccess,
-       [:owner, :admin] when action not in [:index, :new, :create_site]
+  plug(PlausibleWeb.RequireAccountPlug)
 
-  def index(conn, params) do
-    user = conn.assigns[:current_user]
+  plug(
+    PlausibleWeb.Plugs.AuthorizeSiteAccess,
+    [:owner, :admin, :editor, :super_admin] when action not in [:new, :create_site]
+  )
 
-    invitations =
-      Repo.all(
-        from i in Plausible.Auth.Invitation,
-          where: i.email == ^user.email
-      )
-      |> Repo.preload(:site)
-
-    invitation_site_ids = Enum.map(invitations, & &1.site.id)
-
-    {sites, pagination} =
-      Repo.paginate(
-        from(s in Plausible.Site,
-          join: sm in Plausible.Site.Membership,
-          on: sm.site_id == s.id,
-          where: sm.user_id == ^user.id,
-          where: s.id not in ^invitation_site_ids,
-          order_by: s.domain,
-          preload: [memberships: sm]
-        ),
-        params
-      )
-
-    user_owns_sites =
-      Enum.any?(sites, fn site -> List.first(site.memberships).role == :owner end) ||
-        Plausible.Auth.user_owns_sites?(user)
-
-    visitors =
-      Plausible.Stats.Clickhouse.last_24h_visitors(sites ++ Enum.map(invitations, & &1.site))
-
-    render(conn, "index.html",
-      invitations: invitations,
-      sites: sites,
-      visitors: visitors,
-      pagination: pagination,
-      needs_to_upgrade: user_owns_sites && Plausible.Billing.needs_to_upgrade?(user)
-    )
-  end
-
-  def new(conn, _params) do
-    current_user = conn.assigns[:current_user] |> Repo.preload(site_memberships: :site)
-
-    owned_site_count =
-      current_user.site_memberships |> Enum.filter(fn m -> m.role == :owner end) |> Enum.count()
-
-    site_limit = Plausible.Billing.sites_limit(current_user)
-    is_at_limit = site_limit && owned_site_count >= site_limit
-    is_first_site = Enum.empty?(current_user.site_memberships)
-
-    changeset = Plausible.Site.changeset(%Plausible.Site{})
+  def new(conn, params) do
+    flow = params["flow"] || PlausibleWeb.Flows.register()
+    my_team = conn.assigns.my_team
 
     render(conn, "new.html",
-      changeset: changeset,
-      is_first_site: is_first_site,
-      is_at_limit: is_at_limit,
-      site_limit: site_limit,
-      layout: {PlausibleWeb.LayoutView, "focus.html"}
+      changeset: Plausible.Site.changeset(%Plausible.Site{}),
+      site_limit: Plausible.Teams.Billing.site_limit(my_team),
+      site_limit_exceeded?: Plausible.Teams.Billing.ensure_can_add_new_site(my_team) != :ok,
+      form_submit_url: "/sites?flow=#{flow}",
+      flow: flow
     )
   end
 
   def create_site(conn, %{"site" => site_params}) do
-    user = conn.assigns[:current_user]
-    site_count = Enum.count(Plausible.Sites.owned_by(user))
-    is_first_site = site_count == 0
+    team = conn.assigns.my_team
+    user = conn.assigns.current_user
+    first_site? = Plausible.Teams.Billing.site_usage(team) == 0
+    flow = conn.params["flow"]
 
     case Sites.create(user, site_params) do
       {:ok, %{site: site}} ->
-        Plausible.Slack.notify("#{user.name} created #{site.domain} [email=#{user.email}]")
-
-        if is_first_site do
+        if first_site? do
           PlausibleWeb.Email.welcome_email(user)
-          |> Plausible.Mailer.send_email()
+          |> Plausible.Mailer.send()
         end
 
-        conn
-        |> put_session(site.domain <> "_offer_email_report", true)
-        |> redirect(to: "/#{URI.encode_www_form(site.domain)}/snippet")
+        redirect(conn,
+          external:
+            Routes.site_path(conn, :installation, site.domain,
+              site_created: true,
+              flow: flow
+            )
+        )
 
-      {:error, :site, changeset, _} ->
+      {:error, _, {:over_limit, limit}, _} ->
+        render(conn, "new.html",
+          changeset: Plausible.Site.changeset(%Plausible.Site{}),
+          first_site?: first_site?,
+          site_limit: limit,
+          site_limit_exceeded?: true,
+          flow: flow,
+          form_submit_url: "/sites?flow=#{flow}"
+        )
+
+      {:error, _, changeset, _} ->
         render(conn, "new.html",
           changeset: changeset,
-          is_first_site: is_first_site,
-          is_at_limit: false,
-          layout: {PlausibleWeb.LayoutView, "focus.html"}
-        )
-
-      {:error, :limit, _limit} ->
-        send_resp(conn, 400, "Site limit reached")
-    end
-  end
-
-  def add_snippet(conn, _params) do
-    user = conn.assigns[:current_user]
-    site = conn.assigns[:site] |> Repo.preload(:custom_domain)
-
-    is_first_site =
-      !Repo.exists?(
-        from sm in Plausible.Site.Membership,
-          where:
-            sm.user_id == ^user.id and
-              sm.site_id != ^site.id
-      )
-
-    conn
-    |> assign(:skip_plausible_tracking, true)
-    |> render("snippet.html",
-      site: site,
-      is_first_site: is_first_site,
-      layout: {PlausibleWeb.LayoutView, "focus.html"}
-    )
-  end
-
-  def new_goal(conn, _params) do
-    site = conn.assigns[:site]
-    changeset = Plausible.Goal.changeset(%Plausible.Goal{})
-
-    conn
-    |> assign(:skip_plausible_tracking, true)
-    |> render("new_goal.html",
-      site: site,
-      changeset: changeset,
-      layout: {PlausibleWeb.LayoutView, "focus.html"}
-    )
-  end
-
-  def create_goal(conn, %{"goal" => goal}) do
-    site = conn.assigns[:site]
-
-    case Plausible.Goals.create(site, goal) do
-      {:ok, _} ->
-        conn
-        |> put_flash(:success, "Goal created successfully")
-        |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/goals")
-
-      {:error, changeset} ->
-        conn
-        |> assign(:skip_plausible_tracking, true)
-        |> render("new_goal.html",
-          site: site,
-          changeset: changeset,
-          layout: {PlausibleWeb.LayoutView, "focus.html"}
+          first_site?: first_site?,
+          site_limit: Plausible.Teams.Billing.site_limit(team),
+          site_limit_exceeded?: false,
+          flow: flow,
+          form_submit_url: "/sites?flow=#{flow}"
         )
     end
   end
 
-  def delete_goal(conn, %{"website" => website, "id" => goal_id}) do
-    Plausible.Goals.delete(goal_id)
+  def update_feature_visibility(conn, %{
+        "setting" => setting,
+        "r" => "/" <> _ = redirect_path,
+        "set" => value
+      })
+      when setting in ~w[conversions_enabled funnels_enabled props_enabled] and
+             value in ["true", "false"] do
+    site = conn.assigns[:site]
+    toggle_field = String.to_existing_atom(setting)
 
-    conn
-    |> put_flash(:success, "Goal deleted successfully")
-    |> redirect(to: "/#{URI.encode_www_form(website)}/settings/goals")
+    feature_mod =
+      Enum.find(Plausible.Billing.Feature.list(), &(&1.toggle_field() == toggle_field))
+
+    case feature_mod.toggle(site, conn.assigns.current_user, override: value == "true") do
+      {:ok, updated_site} ->
+        message =
+          if Map.fetch!(updated_site, toggle_field) do
+            "#{feature_mod.display_name()} are now visible again on your dashboard"
+          else
+            "#{feature_mod.display_name()} are now hidden from your dashboard"
+          end
+
+        conn
+        |> put_flash(:success, message)
+        |> redirect(to: redirect_path)
+
+      {:error, _} ->
+        conn
+        |> put_flash(
+          :error,
+          "Something went wrong. Failed to toggle #{feature_mod.display_name()} on your dashboard."
+        )
+        |> redirect(to: redirect_path)
+    end
   end
 
-  def settings(conn, %{"website" => website}) do
-    redirect(conn, to: "/#{URI.encode_www_form(website)}/settings/general")
+  def settings(conn, %{"domain" => domain}) do
+    redirect(conn, to: Routes.site_path(conn, :settings_general, domain))
   end
 
   def settings_general(conn, _params) do
-    site =
-      conn.assigns[:site]
-      |> Repo.preload(:custom_domain)
+    site = conn.assigns[:site]
 
     conn
-    |> assign(:skip_plausible_tracking, true)
     |> render("settings_general.html",
       site: site,
       changeset: Plausible.Site.changeset(site, %{}),
+      connect_live_socket: true,
+      dogfood_page_path: "/:dashboard/settings/general",
       layout: {PlausibleWeb.LayoutView, "site_settings.html"}
     )
   end
 
   def settings_people(conn, _params) do
-    site =
-      conn.assigns[:site]
-      |> Repo.preload(memberships: :user, invitations: [], custom_domain: [])
+    site = conn.assigns.site
+
+    %{memberships: memberships, invitations: invitations} =
+      Sites.list_people(site)
 
     conn
-    |> assign(:skip_plausible_tracking, true)
     |> render("settings_people.html",
       site: site,
+      memberships: memberships,
+      invitations: invitations,
+      dogfood_page_path: "/:dashboard/settings/people",
       layout: {PlausibleWeb.LayoutView, "site_settings.html"}
     )
   end
 
   def settings_visibility(conn, _params) do
-    site = conn.assigns[:site] |> Repo.preload(:custom_domain)
-    shared_links = Repo.all(from l in Plausible.Site.SharedLink, where: l.site_id == ^site.id)
+    site = conn.assigns[:site]
+    shared_links = Repo.all(from(l in Plausible.Site.SharedLink, where: l.site_id == ^site.id))
 
     conn
-    |> assign(:skip_plausible_tracking, true)
     |> render("settings_visibility.html",
       site: site,
       shared_links: shared_links,
+      dogfood_page_path: "/:dashboard/settings/visibility",
       layout: {PlausibleWeb.LayoutView, "site_settings.html"}
     )
   end
 
   def settings_goals(conn, _params) do
-    site = conn.assigns[:site] |> Repo.preload(:custom_domain)
-    goals = Goals.for_site(site.domain)
-
     conn
-    |> assign(:skip_plausible_tracking, true)
     |> render("settings_goals.html",
-      site: site,
-      goals: goals,
+      dogfood_page_path: "/:dashboard/settings/goals",
+      connect_live_socket: true,
       layout: {PlausibleWeb.LayoutView, "site_settings.html"}
     )
   end
 
-  def settings_search_console(conn, _params) do
-    site =
-      conn.assigns[:site]
-      |> Repo.preload([:google_auth, :custom_domain])
-
-    search_console_domains =
-      if site.google_auth do
-        Plausible.Google.Api.fetch_verified_properties(site.google_auth)
-      end
-
+  def settings_funnels(conn, _params) do
     conn
-    |> assign(:skip_plausible_tracking, true)
-    |> render("settings_search_console.html",
-      site: site,
-      search_console_domains: search_console_domains,
+    |> render("settings_funnels.html",
+      dogfood_page_path: "/:dashboard/settings/funnels",
+      connect_live_socket: true,
       layout: {PlausibleWeb.LayoutView, "site_settings.html"}
+    )
+  end
+
+  def settings_props(conn, _params) do
+    conn
+    |> render("settings_props.html",
+      dogfood_page_path: "/:dashboard/settings/properties",
+      layout: {PlausibleWeb.LayoutView, "site_settings.html"},
+      connect_live_socket: true
     )
   end
 
   def settings_email_reports(conn, _params) do
-    site = conn.assigns[:site] |> Repo.preload(:custom_domain)
+    site = conn.assigns[:site]
 
     conn
-    |> assign(:skip_plausible_tracking, true)
     |> render("settings_email_reports.html",
       site: site,
       weekly_report: Repo.get_by(Plausible.Site.WeeklyReport, site_id: site.id),
       monthly_report: Repo.get_by(Plausible.Site.MonthlyReport, site_id: site.id),
-      spike_notification: Repo.get_by(Plausible.Site.SpikeNotification, site_id: site.id),
-      layout: {PlausibleWeb.LayoutView, "site_settings.html"}
-    )
-  end
-
-  def settings_custom_domain(conn, _params) do
-    site =
-      conn.assigns[:site]
-      |> Repo.preload(:custom_domain)
-
-    conn
-    |> assign(:skip_plausible_tracking, true)
-    |> render("settings_custom_domain.html",
-      site: site,
+      spike_notification:
+        Repo.get_by(Plausible.Site.TrafficChangeNotification, site_id: site.id, type: :spike),
+      drop_notification:
+        Repo.get_by(Plausible.Site.TrafficChangeNotification, site_id: site.id, type: :drop),
+      dogfood_page_path: "/:dashboard/settings/email-reports",
       layout: {PlausibleWeb.LayoutView, "site_settings.html"}
     )
   end
 
   def settings_danger_zone(conn, _params) do
-    site = conn.assigns[:site] |> Repo.preload(:custom_domain)
+    site = conn.assigns[:site]
 
     conn
-    |> assign(:skip_plausible_tracking, true)
     |> render("settings_danger_zone.html",
       site: site,
+      dogfood_page_path: "/:dashboard/settings/danger-zone",
+      layout: {PlausibleWeb.LayoutView, "site_settings.html"}
+    )
+  end
+
+  def settings_integrations(conn, _params) do
+    site =
+      conn.assigns.site
+      |> Repo.preload([:google_auth])
+
+    search_console_domains =
+      if site.google_auth do
+        Plausible.Google.API.fetch_verified_properties(site.google_auth)
+      end
+
+    has_plugins_tokens? = Plausible.Plugins.API.Tokens.any?(site)
+
+    conn
+    |> render("settings_integrations.html",
+      site: site,
+      has_plugins_tokens?: has_plugins_tokens?,
+      search_console_domains: search_console_domains,
+      dogfood_page_path: "/:dashboard/settings/integrations",
+      connect_live_socket: true,
+      layout: {PlausibleWeb.LayoutView, "site_settings.html"}
+    )
+  end
+
+  def settings_shields(conn, %{"shield" => shield})
+      when shield in ["ip_addresses", "countries", "pages", "hostnames"] do
+    site = conn.assigns.site
+
+    conn
+    |> render("settings_shields.html",
+      site: site,
+      shield: shield,
+      dogfood_page_path: "/:dashboard/settings/shields/#{shield}",
+      connect_live_socket: true,
+      layout: {PlausibleWeb.LayoutView, "site_settings.html"}
+    )
+  end
+
+  def settings_imports_exports(conn, _params) do
+    site = conn.assigns.site
+
+    conn
+    |> render("settings_imports_exports.html",
+      site: site,
+      dogfood_page_path: "/:dashboard/settings/imports-exports",
+      connect_live_socket: true,
       layout: {PlausibleWeb.LayoutView, "site_settings.html"}
     )
   end
@@ -285,7 +262,7 @@ defmodule PlausibleWeb.SiteController do
 
     conn
     |> put_flash(:success, "Google integration saved successfully")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/search-console")
+    |> redirect(external: Routes.site_path(conn, :settings_integrations, site.domain))
   end
 
   def delete_google_auth(conn, _params) do
@@ -295,47 +272,51 @@ defmodule PlausibleWeb.SiteController do
 
     Repo.delete!(site.google_auth)
 
-    conn
-    |> put_flash(:success, "Google account unlinked from Plausible")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/search-console")
+    conn = put_flash(conn, :success, "Google account unlinked from Plausible")
+
+    redirect(conn, external: Routes.site_path(conn, :settings_integrations, site.domain))
   end
 
   def update_settings(conn, %{"site" => site_params}) do
     site = conn.assigns[:site]
-    changeset = site |> Plausible.Site.changeset(site_params)
-    res = changeset |> Repo.update()
+    changeset = Plausible.Site.update_changeset(site, site_params)
 
-    case res do
+    case Repo.update(changeset) do
       {:ok, site} ->
         site_session_key = "authorized_site__" <> site.domain
 
         conn
         |> put_session(site_session_key, nil)
         |> put_flash(:success, "Your site settings have been saved")
-        |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/general")
+        |> redirect(external: Routes.site_path(conn, :settings_general, site.domain))
 
       {:error, changeset} ->
-        render(conn, "settings_general.html", site: site, changeset: changeset)
+        conn
+        |> put_flash(:error, "Could not update your site settings")
+        |> render("settings_general.html",
+          site: site,
+          changeset: changeset,
+          layout: {PlausibleWeb.LayoutView, "site_settings.html"}
+        )
     end
   end
 
   def reset_stats(conn, _params) do
     site = conn.assigns[:site]
-    Plausible.ClickhouseRepo.clear_stats_for(site.domain)
+    Plausible.Purge.reset!(site)
 
     conn
     |> put_flash(:success, "#{site.domain} stats will be reset in a few minutes")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/danger-zone")
+    |> redirect(external: Routes.site_path(conn, :settings_danger_zone, site.domain))
   end
 
   def delete_site(conn, _params) do
     site = conn.assigns[:site]
 
-    Repo.delete!(site)
-    Plausible.ClickhouseRepo.clear_stats_for(site.domain)
+    Plausible.Site.Removal.run(site)
 
     conn
-    |> put_flash(:success, "Site deleted successfully along with all pageviews")
+    |> put_flash(:success, "Your site and page views deletion process has started.")
     |> redirect(to: "/sites")
   end
 
@@ -347,7 +328,7 @@ defmodule PlausibleWeb.SiteController do
 
     conn
     |> put_flash(:success, "Stats for #{site.domain} are now public.")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/visibility")
+    |> redirect(external: Routes.site_path(conn, :settings_visibility, site.domain))
   end
 
   def make_private(conn, _params) do
@@ -358,30 +339,33 @@ defmodule PlausibleWeb.SiteController do
 
     conn
     |> put_flash(:success, "Stats for #{site.domain} are now private.")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/visibility")
+    |> redirect(external: Routes.site_path(conn, :settings_visibility, site.domain))
   end
 
   def enable_weekly_report(conn, _params) do
     site = conn.assigns[:site]
 
-    Plausible.Site.WeeklyReport.changeset(%Plausible.Site.WeeklyReport{}, %{
-      site_id: site.id,
-      recipients: [conn.assigns[:current_user].email]
-    })
-    |> Repo.insert!()
+    result =
+      Plausible.Site.WeeklyReport.changeset(%Plausible.Site.WeeklyReport{}, %{
+        site_id: site.id,
+        recipients: [conn.assigns[:current_user].email]
+      })
+      |> Repo.insert()
+
+    :ok = tolerate_unique_contraint_violation(result, "weekly_reports_site_id_index")
 
     conn
     |> put_flash(:success, "You will receive an email report every Monday going forward")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+    |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
   end
 
   def disable_weekly_report(conn, _params) do
     site = conn.assigns[:site]
-    Repo.delete_all(from wr in Plausible.Site.WeeklyReport, where: wr.site_id == ^site.id)
+    Repo.delete_all(from(wr in Plausible.Site.WeeklyReport, where: wr.site_id == ^site.id))
 
     conn
     |> put_flash(:success, "You will not receive weekly email reports going forward")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+    |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
   end
 
   def add_weekly_report_recipient(conn, %{"recipient" => recipient}) do
@@ -393,7 +377,7 @@ defmodule PlausibleWeb.SiteController do
 
     conn
     |> put_flash(:success, "Added #{recipient} as a recipient for the weekly report")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+    |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
   end
 
   def remove_weekly_report_recipient(conn, %{"recipient" => recipient}) do
@@ -408,30 +392,34 @@ defmodule PlausibleWeb.SiteController do
       :success,
       "Removed #{recipient} as a recipient for the weekly report"
     )
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+    |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
   end
 
   def enable_monthly_report(conn, _params) do
     site = conn.assigns[:site]
 
-    Plausible.Site.MonthlyReport.changeset(%Plausible.Site.MonthlyReport{}, %{
-      site_id: site.id,
-      recipients: [conn.assigns[:current_user].email]
-    })
-    |> Repo.insert!()
+    result =
+      %Plausible.Site.MonthlyReport{}
+      |> Plausible.Site.MonthlyReport.changeset(%{
+        site_id: site.id,
+        recipients: [conn.assigns[:current_user].email]
+      })
+      |> Repo.insert()
+
+    :ok = tolerate_unique_contraint_violation(result, "monthly_reports_site_id_index")
 
     conn
     |> put_flash(:success, "You will receive an email report every month going forward")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+    |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
   end
 
   def disable_monthly_report(conn, _params) do
     site = conn.assigns[:site]
-    Repo.delete_all(from mr in Plausible.Site.MonthlyReport, where: mr.site_id == ^site.id)
+    Repo.delete_all(from(mr in Plausible.Site.MonthlyReport, where: mr.site_id == ^site.id))
 
     conn
     |> put_flash(:success, "You will not receive monthly email reports going forward")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+    |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
   end
 
   def add_monthly_report_recipient(conn, %{"recipient" => recipient}) do
@@ -443,7 +431,7 @@ defmodule PlausibleWeb.SiteController do
 
     conn
     |> put_flash(:success, "Added #{recipient} as a recipient for the monthly report")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+    |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
   end
 
   def remove_monthly_report_recipient(conn, %{"recipient" => recipient}) do
@@ -458,71 +446,88 @@ defmodule PlausibleWeb.SiteController do
       :success,
       "Removed #{recipient} as a recipient for the monthly report"
     )
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+    |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
   end
 
-  def enable_spike_notification(conn, _params) do
+  def enable_traffic_change_notification(conn, %{"type" => type}) do
     site = conn.assigns[:site]
 
     res =
-      Plausible.Site.SpikeNotification.changeset(%Plausible.Site.SpikeNotification{}, %{
-        site_id: site.id,
-        threshold: 10,
-        recipients: [conn.assigns[:current_user].email]
-      })
+      Plausible.Site.TrafficChangeNotification.changeset(
+        %Plausible.Site.TrafficChangeNotification{},
+        %{
+          site_id: site.id,
+          type: type,
+          threshold: if(type == "spike", do: 10, else: 1),
+          recipients: [conn.assigns[:current_user].email]
+        }
+      )
       |> Repo.insert()
 
     case res do
       {:ok, _} ->
         conn
-        |> put_flash(:success, "You will a notification with traffic spikes going forward")
-        |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+        |> put_flash(:success, "Traffic #{type} notifications enabled")
+        |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
 
       {:error, _} ->
         conn
-        |> put_flash(:error, "Unable to create a spike notification")
-        |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+        |> put_flash(:error, "Unable to create a #{type} notification")
+        |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
     end
   end
 
-  def disable_spike_notification(conn, _params) do
+  def disable_traffic_change_notification(conn, %{"type" => type}) do
     site = conn.assigns[:site]
-    Repo.delete_all(from mr in Plausible.Site.SpikeNotification, where: mr.site_id == ^site.id)
+
+    Repo.delete_all(
+      from(mr in Plausible.Site.TrafficChangeNotification,
+        where: mr.site_id == ^site.id and mr.type == ^type
+      )
+    )
 
     conn
-    |> put_flash(:success, "Spike notification disabled")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+    |> put_flash(:success, "Traffic #{type} notifications disabled")
+    |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
   end
 
-  def update_spike_notification(conn, %{"spike_notification" => params}) do
+  def update_traffic_change_notification(conn, %{
+        "traffic_change_notification" => params,
+        "type" => type
+      }) do
     site = conn.assigns[:site]
-    notification = Repo.get_by(Plausible.Site.SpikeNotification, site_id: site.id)
 
-    Plausible.Site.SpikeNotification.changeset(notification, params)
+    notification =
+      Repo.get_by(Plausible.Site.TrafficChangeNotification, site_id: site.id, type: type)
+
+    Plausible.Site.TrafficChangeNotification.changeset(notification, params)
     |> Repo.update!()
 
     conn
     |> put_flash(:success, "Notification settings updated")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+    |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
   end
 
-  def add_spike_notification_recipient(conn, %{"recipient" => recipient}) do
+  def add_traffic_change_notification_recipient(conn, %{"recipient" => recipient, "type" => type}) do
     site = conn.assigns[:site]
 
-    Repo.get_by(Plausible.Site.SpikeNotification, site_id: site.id)
-    |> Plausible.Site.SpikeNotification.add_recipient(recipient)
+    Repo.get_by(Plausible.Site.TrafficChangeNotification, site_id: site.id, type: type)
+    |> Plausible.Site.TrafficChangeNotification.add_recipient(recipient)
     |> Repo.update!()
 
     conn
     |> put_flash(:success, "Added #{recipient} as a recipient for the traffic spike notification")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+    |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
   end
 
-  def remove_spike_notification_recipient(conn, %{"recipient" => recipient}) do
+  def remove_traffic_change_notification_recipient(conn, %{
+        "recipient" => recipient,
+        "type" => type
+      }) do
     site = conn.assigns[:site]
 
-    Repo.get_by(Plausible.Site.SpikeNotification, site_id: site.id)
-    |> Plausible.Site.SpikeNotification.remove_recipient(recipient)
+    Repo.get_by(Plausible.Site.TrafficChangeNotification, site_id: site.id, type: type)
+    |> Plausible.Site.TrafficChangeNotification.remove_recipient(recipient)
     |> Repo.update!()
 
     conn
@@ -530,7 +535,7 @@ defmodule PlausibleWeb.SiteController do
       :success,
       "Removed #{recipient} as a recipient for the monthly report"
     )
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/email-reports")
+    |> redirect(external: Routes.site_path(conn, :settings_email_reports, site.domain))
   end
 
   def new_shared_link(conn, _params) do
@@ -541,8 +546,7 @@ defmodule PlausibleWeb.SiteController do
     |> assign(:skip_plausible_tracking, true)
     |> render("new_shared_link.html",
       site: site,
-      changeset: changeset,
-      layout: {PlausibleWeb.LayoutView, "focus.html"}
+      changeset: changeset
     )
   end
 
@@ -551,15 +555,14 @@ defmodule PlausibleWeb.SiteController do
 
     case Sites.create_shared_link(site, link["name"], link["password"]) do
       {:ok, _created} ->
-        redirect(conn, to: "/#{URI.encode_www_form(site.domain)}/settings/visibility")
+        redirect(conn, external: Routes.site_path(conn, :settings_visibility, site.domain))
 
       {:error, changeset} ->
         conn
         |> assign(:skip_plausible_tracking, true)
         |> render("new_shared_link.html",
           site: site,
-          changeset: changeset,
-          layout: {PlausibleWeb.LayoutView, "focus.html"}
+          changeset: changeset
         )
     end
   end
@@ -573,8 +576,7 @@ defmodule PlausibleWeb.SiteController do
     |> assign(:skip_plausible_tracking, true)
     |> render("edit_shared_link.html",
       site: site,
-      changeset: changeset,
-      layout: {PlausibleWeb.LayoutView, "focus.html"}
+      changeset: changeset
     )
   end
 
@@ -585,92 +587,174 @@ defmodule PlausibleWeb.SiteController do
 
     case Repo.update(changeset) do
       {:ok, _created} ->
-        redirect(conn, to: "/#{URI.encode_www_form(site.domain)}/settings/visibility")
+        redirect(conn, external: Routes.site_path(conn, :settings_visibility, site.domain))
 
       {:error, changeset} ->
         conn
         |> assign(:skip_plausible_tracking, true)
         |> render("edit_shared_link.html",
           site: site,
-          changeset: changeset,
-          layout: {PlausibleWeb.LayoutView, "focus.html"}
+          changeset: changeset
         )
     end
   end
 
   def delete_shared_link(conn, %{"slug" => slug}) do
     site = conn.assigns[:site]
+    site_id = site.id
 
-    Repo.get_by(Plausible.Site.SharedLink, slug: slug)
-    |> Repo.delete!()
+    case Repo.delete_all(
+           from(l in Plausible.Site.SharedLink,
+             where: l.slug == ^slug,
+             where: l.site_id == ^site_id
+           )
+         ) do
+      {1, _} ->
+        conn
+        |> put_flash(:success, "Shared Link deleted")
+        |> redirect(external: Routes.site_path(conn, :settings_visibility, site.domain))
 
-    redirect(conn, to: "/#{URI.encode_www_form(site.domain)}/settings/visibility")
+      {0, _} ->
+        conn
+        |> put_flash(:error, "Could not find Shared Link")
+        |> redirect(external: Routes.site_path(conn, :settings_visibility, site.domain))
+    end
   end
 
-  def new_custom_domain(conn, _params) do
-    site = conn.assigns[:site]
-    changeset = Plausible.Site.CustomDomain.changeset(%Plausible.Site.CustomDomain{}, %{})
+  def forget_import(conn, %{"import_id" => import_id}) do
+    site = conn.assigns.site
+
+    if site_import = Plausible.Imported.get_import(site, import_id) do
+      Oban.cancel_all_jobs(
+        from(j in Oban.Job,
+          where:
+            j.queue == "analytics_imports" and
+              fragment("(? ->> 'import_id')::int", j.args) == ^site_import.id
+        )
+      )
+
+      Plausible.Purge.delete_imported_stats!(site_import)
+
+      Plausible.Repo.delete!(site_import)
+    end
 
     conn
+    |> put_flash(:success, "Imported data has been cleared")
+    |> redirect(external: Routes.site_path(conn, :settings_imports_exports, site.domain))
+  end
+
+  def forget_imported(conn, _params) do
+    site = conn.assigns.site
+
+    import_ids =
+      site
+      |> Plausible.Imported.list_all_imports()
+      |> Enum.map(& &1.id)
+
+    if import_ids != [] do
+      Oban.cancel_all_jobs(
+        from(j in Oban.Job,
+          where:
+            j.queue == "analytics_imports" and
+              fragment("(? ->> 'import_id')::int", j.args) in ^import_ids
+        )
+      )
+
+      Plausible.Purge.delete_imported_stats!(site)
+
+      Plausible.Imported.delete_imports_for_site(site)
+    end
+
+    conn
+    |> put_flash(:success, "Imported data has been cleared")
+    |> redirect(external: Routes.site_path(conn, :settings_integrations, site.domain))
+  end
+
+  on_ee do
+    def download_export(conn, _params) do
+      %{id: site_id, domain: domain} = conn.assigns.site
+
+      if s3_export = Plausible.Exports.get_s3_export!(site_id) do
+        s3_bucket = Plausible.S3.exports_bucket()
+        download_url = Plausible.S3.download_url(s3_bucket, s3_export.path)
+        redirect(conn, external: download_url)
+      else
+        conn
+        |> put_flash(:error, "Export not found")
+        |> redirect(external: Routes.site_path(conn, :settings_imports_exports, domain))
+      end
+    end
+  else
+    def download_export(conn, _params) do
+      %{id: site_id, domain: domain, timezone: timezone} = conn.assigns.site
+
+      if local_export = Plausible.Exports.get_local_export(site_id, domain, timezone) do
+        %{path: export_path, name: name} = local_export
+
+        conn
+        |> put_resp_content_type("application/zip")
+        |> put_resp_header("content-disposition", Plausible.Exports.content_disposition(name))
+        |> send_file(200, export_path)
+      else
+        conn
+        |> put_flash(:error, "Export not found")
+        |> redirect(external: Routes.site_path(conn, :settings_imports_exports, domain))
+      end
+    end
+  end
+
+  def csv_import(conn, _params) do
+    conn
     |> assign(:skip_plausible_tracking, true)
-    |> render("new_custom_domain.html",
-      site: site,
-      changeset: changeset,
-      layout: {PlausibleWeb.LayoutView, "focus.html"}
+    |> render("csv_import.html",
+      connect_live_socket: true
     )
   end
 
-  def custom_domain_dns_setup(conn, _params) do
-    site = conn.assigns[:site] |> Repo.preload(:custom_domain)
+  def change_domain(conn, _params) do
+    changeset = Plausible.Site.update_changeset(conn.assigns.site)
 
-    conn
-    |> assign(:skip_plausible_tracking, true)
-    |> render("custom_domain_dns_setup.html",
-      site: site,
-      layout: {PlausibleWeb.LayoutView, "focus.html"}
+    render(conn, "change_domain.html",
+      skip_plausible_tracking: true,
+      changeset: changeset
     )
   end
 
-  def custom_domain_snippet(conn, _params) do
-    site =
-      conn.assigns[:site]
-      |> Repo.preload(:custom_domain)
-
-    conn
-    |> assign(:skip_plausible_tracking, true)
-    |> render("custom_domain_snippet.html",
-      site: site,
-      layout: {PlausibleWeb.LayoutView, "focus.html"}
-    )
-  end
-
-  def add_custom_domain(conn, %{"custom_domain" => domain}) do
-    site = conn.assigns[:site]
-
-    case Sites.add_custom_domain(site, domain["domain"]) do
-      {:ok, _custom_domain} ->
-        redirect(conn, to: "/sites/#{URI.encode_www_form(site.domain)}/custom-domains/dns-setup")
+  def change_domain_submit(conn, %{"site" => %{"domain" => new_domain}}) do
+    case Plausible.Site.Domain.change(conn.assigns.site, new_domain) do
+      {:ok, updated_site} ->
+        conn
+        |> put_flash(:success, "Website domain changed successfully")
+        |> redirect(
+          external:
+            Routes.site_path(conn, :installation, updated_site.domain,
+              flow: PlausibleWeb.Flows.domain_change()
+            )
+        )
 
       {:error, changeset} ->
-        conn
-        |> assign(:skip_plausible_tracking, true)
-        |> render("new_custom_domain.html",
-          site: site,
-          changeset: changeset,
-          layout: {PlausibleWeb.LayoutView, "focus.html"}
+        render(conn, "change_domain.html",
+          skip_plausible_tracking: true,
+          changeset: changeset
         )
     end
   end
 
-  def delete_custom_domain(conn, _params) do
-    site =
-      conn.assigns[:site]
-      |> Repo.preload(:custom_domain)
+  defp tolerate_unique_contraint_violation(result, name) do
+    case result do
+      {:ok, _} ->
+        :ok
 
-    Repo.delete!(site.custom_domain)
+      {:error,
+       %{
+         errors: [
+           site_id: {_, [constraint: :unique, constraint_name: ^name]}
+         ]
+       }} ->
+        :ok
 
-    conn
-    |> put_flash(:success, "Custom domain deleted successfully")
-    |> redirect(to: "/#{URI.encode_www_form(site.domain)}/settings/general")
+      other ->
+        other
+    end
   end
 end

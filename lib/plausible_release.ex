@@ -1,37 +1,137 @@
 defmodule Plausible.Release do
+  use Plausible
   use Plausible.Repo
+  require Logger
+
   @app :plausible
   @start_apps [
+    :ssl,
     :postgrex,
-    :clickhousex,
+    :ch,
     :ecto
   ]
 
-  def init_admin do
-    prepare()
-
-    {admin_email, admin_user, admin_pwd} =
-      validate_admin(
-        {Application.get_env(:plausible, :admin_email),
-         Application.get_env(:plausible, :admin_user),
-         Application.get_env(:plausible, :admin_pwd)}
-      )
-
-    case Plausible.Auth.find_user_by(email: admin_email) do
-      nil ->
-        {:ok, _} = Plausible.Auth.create_user(admin_user, admin_email, admin_pwd)
-        IO.puts("Admin user created successful!")
-
-      _ ->
-        IO.puts("Admin user already exists. I won't override, bailing")
+  def should_be_first_launch? do
+    on_ee do
+      false
+    else
+      not (_has_users? = Repo.exists?(Plausible.Auth.User))
     end
   end
 
-  def migrate do
+  @doc """
+  `interweave_migrate/0` is a migration function that:
+
+  - Lists all pending migrations across multiple repositories.
+  - Sorts these migrations into a single list.
+  - Groups consecutive migrations by repository into "streaks".
+  - Executes the migrations in the correct order by processing each streak sequentially.
+
+  ### Why Use This Approach?
+
+  This function resolves dependencies between migrations that span across different repositories.
+  The default `migrate/0` function migrates each repository independently, which may result in
+  migrations running in the wrong order when there are cross-repository dependencies.
+
+  Consider the following example (adapted from reality, not 100% accurate):
+
+  - **Migration 1**: The PostgreSQL (PG) repository creates a table named `site_imports`.
+  - **Migration 2**: The ClickHouse (CH) repository creates `import_id` columns in `imported_*` tables.
+  - **Migration 3**: The PG repository runs a data migration that utilizes both PG and CH databases,
+    reading from the `import_id` column in `imported_*` tables.
+
+  The default `migrate/0` would execute these migrations by repository, resulting in the following order:
+
+  1. Migration 1 (PG)
+  2. Migration 3 (PG)
+  3. Migration 2 (CH)
+
+  This sequence would fail at Migration 3, as the `import_id` columns in the CH repository have not been created yet.
+
+  `interweave_migrate/0` addresses this issue by consolidating all pending migrations into a single, ordered queue:
+
+  1. Migration 1 (PG)
+  2. Migration 2 (CH)
+  3. Migration 3 (PG)
+
+  This ensures all dependencies are resolved in the correct order.
+  """
+  def interweave_migrate(repos \\ repos()) do
     prepare()
-    Enum.each(repos(), &run_migrations_for/1)
-    IO.puts("Migrations successful!")
+
+    pending = all_pending_migrations(repos)
+    streaks = migration_streaks(pending)
+
+    Enum.each(streaks, fn {repo, up_to_version} ->
+      {:ok, _, _} = Ecto.Migrator.with_repo(repo, &Ecto.Migrator.run(&1, :up, to: up_to_version))
+    end)
   end
+
+  defp migration_streaks(pending_migrations) do
+    sorted_migrations =
+      pending_migrations
+      |> Enum.map(fn {repo, version, _name} -> {repo, version} end)
+      |> Enum.sort_by(fn {_repo, version} -> version end, :asc)
+
+    streaks_reversed =
+      Enum.reduce(sorted_migrations, [], fn {repo, _version} = latest_migration, streaks_acc ->
+        case streaks_acc do
+          # start the streak for repo
+          [] -> [latest_migration]
+          # extend the streak
+          [{^repo, _prev_version} | rest] -> [latest_migration | rest]
+          # end the streak for prev_repo, start the streak for repo
+          [{_prev_repo, _prev_version} | _rest] -> [latest_migration | streaks_acc]
+        end
+      end)
+
+    :lists.reverse(streaks_reversed)
+  end
+
+  @spec all_pending_migrations([Ecto.Repo.t()]) :: [{Ecto.Repo.t(), integer, String.t()}]
+  defp all_pending_migrations(repos) do
+    Enum.flat_map(repos, fn repo ->
+      # credo:disable-for-lines:6 Credo.Check.Refactor.Nesting
+      {:ok, pending, _started} =
+        Ecto.Migrator.with_repo(repo, fn repo ->
+          Ecto.Migrator.migrations(repo)
+          |> Enum.filter(fn {status, _version, _name} -> status == :down end)
+          |> Enum.map(fn {_status, version, name} -> {repo, version, name} end)
+        end)
+
+      pending
+    end)
+  end
+
+  def pending_streaks(repos \\ repos()) do
+    prepare()
+    IO.puts("Collecting pending migrations..")
+
+    pending = all_pending_migrations(repos)
+
+    if pending == [] do
+      IO.puts("No pending migrations!")
+    else
+      streaks = migration_streaks(pending)
+      print_migration_streaks(streaks, pending)
+    end
+  end
+
+  defp print_migration_streaks([{repo, up_to_version} | streaks], pending) do
+    {streak, pending} =
+      Enum.split_with(pending, fn {pending_repo, version, _name} ->
+        pending_repo == repo and version <= up_to_version
+      end)
+
+    IO.puts(
+      "\n#{inspect(repo)} [#{Path.relative_to_cwd(Ecto.Migrator.migrations_path(repo))}] streak up to version #{up_to_version}:"
+    )
+
+    Enum.each(streak, fn {_repo, version, name} -> IO.puts("  * #{version}_#{name}") end)
+    print_migration_streaks(streaks, pending)
+  end
+
+  defp print_migration_streaks([], []), do: :ok
 
   def seed do
     prepare()
@@ -41,10 +141,10 @@ defmodule Plausible.Release do
     IO.puts("Success!")
   end
 
-  def createdb do
+  def createdb(repos \\ repos()) do
     prepare()
 
-    for repo <- repos() do
+    for repo <- repos do
       :ok = ensure_repo_created(repo)
     end
 
@@ -79,19 +179,36 @@ defmodule Plausible.Release do
     Application.put_env(:ua_inspector, :database_path, priv_dir)
   end
 
+  def dump_plans() do
+    prepare()
+
+    Repo.delete_all("plans")
+
+    plans =
+      Plausible.Billing.Plans.all()
+      |> Plausible.Billing.Plans.with_prices()
+      |> Enum.map(fn plan ->
+        plan = Map.from_struct(plan)
+
+        monthly_cost = plan.monthly_cost && Money.to_decimal(plan.monthly_cost)
+        yearly_cost = plan.yearly_cost && Money.to_decimal(plan.yearly_cost)
+        {:ok, features} = Plausible.Billing.Ecto.FeatureList.dump(plan.features)
+        {:ok, team_member_limit} = Plausible.Billing.Ecto.Limit.dump(plan.team_member_limit)
+
+        plan
+        |> Map.drop([:id])
+        |> Map.put(:kind, Atom.to_string(plan.kind))
+        |> Map.put(:monthly_cost, monthly_cost)
+        |> Map.put(:yearly_cost, yearly_cost)
+        |> Map.put(:features, features)
+        |> Map.put(:team_member_limit, team_member_limit)
+      end)
+
+    {count, _} = Repo.insert_all("plans", plans)
+    IO.puts("Inserted #{count} plans")
+  end
+
   ##############################
-
-  defp validate_admin({nil, nil, nil}) do
-    random_user = :crypto.strong_rand_bytes(8) |> Base.encode64() |> binary_part(0, 8)
-    random_pwd = :crypto.strong_rand_bytes(20) |> Base.encode64() |> binary_part(0, 20)
-    random_email = "#{random_user}@#{System.get_env("HOST")}"
-    IO.puts("generated admin user/password: #{random_email} / #{random_pwd}")
-    {random_email, random_user, random_pwd}
-  end
-
-  defp validate_admin({admin_email, admin_user, admin_password}) do
-    {admin_email, admin_user, admin_password}
-  end
 
   defp repos do
     Application.fetch_env!(@app, :ecto_repos)
@@ -107,18 +224,26 @@ defmodule Plausible.Release do
     end
   end
 
-  defp run_migrations_for(repo) do
-    IO.puts("Running migrations for #{repo}")
-    {:ok, _, _} = Ecto.Migrator.with_repo(repo, &Ecto.Migrator.run(&1, :up, all: true))
-  end
-
   defp ensure_repo_created(repo) do
-    IO.puts("create #{inspect(repo)} database if it doesn't exist")
+    config = repo.config()
+    adapter = repo.__adapter__()
 
-    case repo.__adapter__.storage_up(repo.config) do
-      :ok -> :ok
-      {:error, :already_up} -> :ok
-      {:error, term} -> {:error, term}
+    case adapter.storage_status(config) do
+      :up ->
+        IO.puts("#{inspect(repo)} database already exists")
+        :ok
+
+      :down ->
+        IO.puts("Creating #{inspect(repo)} database..")
+
+        case adapter.storage_up(config) do
+          :ok -> :ok
+          {:error, :already_up} -> :ok
+          {:error, _reason} = error -> error
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -133,7 +258,7 @@ defmodule Plausible.Release do
   defp prepare do
     IO.puts("Loading #{@app}..")
     # Load the code for myapp, but don't start it
-    :ok = Application.load(@app)
+    :ok = Application.ensure_loaded(@app)
 
     IO.puts("Starting dependencies..")
     # Start apps necessary for executing migrations

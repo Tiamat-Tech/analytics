@@ -1,248 +1,190 @@
 defmodule Plausible.Stats.Query do
-  defstruct date_range: nil,
+  use Plausible
+
+  defstruct utc_time_range: nil,
             interval: nil,
             period: nil,
-            filters: %{},
-            sample_threshold: 10_000_000
+            dimensions: [],
+            filters: [],
+            sample_threshold: 20_000_000,
+            include_imported: false,
+            skip_imported_reason: nil,
+            now: nil,
+            latest_import_end_date: nil,
+            metrics: [],
+            order_by: nil,
+            timezone: nil,
+            legacy_breakdown: false,
+            preloaded_goals: [],
+            include: Plausible.Stats.Filters.QueryParser.default_include(),
+            debug_metadata: %{},
+            pagination: nil,
+            # Revenue metric specific metadata
+            revenue_currencies: %{},
+            revenue_warning: nil,
+            remove_unavailable_revenue_metrics: false,
+            site_id: nil,
+            site_native_stats_start_at: nil
 
-  @default_sample_threshold 10_000_000
+  require OpenTelemetry.Tracer, as: Tracer
+  alias Plausible.Stats.{DateTimeRange, Filters, Imported, Legacy}
 
-  def shift_back(%__MODULE__{period: "month"} = query, site) do
-    # Querying current month to date
-    {new_first, new_last} =
-      if Timex.compare(Timex.now(site.timezone), query.date_range.first, :month) == 0 do
-        diff =
-          Timex.diff(
-            Timex.beginning_of_month(Timex.now(site.timezone)),
-            Timex.now(site.timezone),
-            :days
-          ) - 1
+  @type t :: %__MODULE__{}
 
-        {query.date_range.first |> Timex.shift(days: diff),
-         Timex.now(site.timezone) |> Timex.to_date() |> Timex.shift(days: diff)}
-      else
-        diff = Timex.diff(query.date_range.first, query.date_range.last, :days) - 1
+  def build(site, schema_type, params, debug_metadata) do
+    with {:ok, query_data} <- Filters.QueryParser.parse(site, schema_type, params) do
+      query =
+        struct!(__MODULE__, Map.to_list(query_data))
+        |> put_imported_opts(site)
+        |> struct!(
+          now: DateTime.utc_now(:second),
+          debug_metadata: debug_metadata,
+          site_id: site.id,
+          site_native_stats_start_at: site.native_stats_start_at
+        )
 
-        {query.date_range.first |> Timex.shift(days: diff),
-         query.date_range.last |> Timex.shift(days: diff)}
+      on_ee do
+        query = Plausible.Stats.Sampling.put_threshold(query, site, params)
       end
 
-    Map.put(query, :date_range, Date.range(new_first, new_last))
-  end
-
-  def shift_back(query, _site) do
-    diff = Timex.diff(query.date_range.first, query.date_range.last, :days) - 1
-    new_first = query.date_range.first |> Timex.shift(days: diff)
-    new_last = query.date_range.last |> Timex.shift(days: diff)
-    Map.put(query, :date_range, Date.range(new_first, new_last))
-  end
-
-  def from(tz, %{"period" => "realtime"} = params) do
-    date = today(tz)
-
-    %__MODULE__{
-      period: "realtime",
-      interval: "minute",
-      date_range: Date.range(date, date),
-      filters: parse_filters(params),
-      sample_threshold: Map.get(params, "sample_threshold", @default_sample_threshold)
-    }
-  end
-
-  def from(tz, %{"period" => "day"} = params) do
-    date = parse_single_date(tz, params)
-
-    %__MODULE__{
-      period: "day",
-      date_range: Date.range(date, date),
-      interval: "hour",
-      filters: parse_filters(params),
-      sample_threshold: Map.get(params, "sample_threshold", @default_sample_threshold)
-    }
-  end
-
-  def from(tz, %{"period" => "7d"} = params) do
-    end_date = parse_single_date(tz, params)
-    start_date = end_date |> Timex.shift(days: -6)
-
-    %__MODULE__{
-      period: "7d",
-      date_range: Date.range(start_date, end_date),
-      interval: "date",
-      filters: parse_filters(params),
-      sample_threshold: Map.get(params, "sample_threshold", @default_sample_threshold)
-    }
-  end
-
-  def from(tz, %{"period" => "30d"} = params) do
-    end_date = parse_single_date(tz, params)
-    start_date = end_date |> Timex.shift(days: -30)
-
-    %__MODULE__{
-      period: "30d",
-      date_range: Date.range(start_date, end_date),
-      interval: "date",
-      filters: parse_filters(params),
-      sample_threshold: Map.get(params, "sample_threshold", @default_sample_threshold)
-    }
-  end
-
-  def from(tz, %{"period" => "month"} = params) do
-    date = parse_single_date(tz, params)
-
-    start_date = Timex.beginning_of_month(date)
-    end_date = Timex.end_of_month(date)
-
-    %__MODULE__{
-      period: "month",
-      date_range: Date.range(start_date, end_date),
-      interval: "date",
-      filters: parse_filters(params),
-      sample_threshold: Map.get(params, "sample_threshold", @default_sample_threshold)
-    }
-  end
-
-  def from(tz, %{"period" => "6mo"} = params) do
-    end_date =
-      parse_single_date(tz, params)
-      |> Timex.end_of_month()
-
-    start_date =
-      Timex.shift(end_date, months: -5)
-      |> Timex.beginning_of_month()
-
-    %__MODULE__{
-      period: "6mo",
-      date_range: Date.range(start_date, end_date),
-      interval: Map.get(params, "interval", "month"),
-      filters: parse_filters(params),
-      sample_threshold: Map.get(params, "sample_threshold", @default_sample_threshold)
-    }
-  end
-
-  def from(tz, %{"period" => "12mo"} = params) do
-    end_date =
-      parse_single_date(tz, params)
-      |> Timex.end_of_month()
-
-    start_date =
-      Timex.shift(end_date, months: -11)
-      |> Timex.beginning_of_month()
-
-    %__MODULE__{
-      period: "12mo",
-      date_range: Date.range(start_date, end_date),
-      interval: Map.get(params, "interval", "month"),
-      filters: parse_filters(params),
-      sample_threshold: Map.get(params, "sample_threshold", @default_sample_threshold)
-    }
-  end
-
-  def from(tz, %{"period" => "custom", "from" => from, "to" => to} = params) do
-    new_params =
-      params
-      |> Map.delete("from")
-      |> Map.delete("to")
-      |> Map.put("date", Enum.join([from, to], ","))
-
-    from(tz, new_params)
-  end
-
-  def from(_tz, %{"period" => "custom", "date" => date} = params) do
-    [from, to] = String.split(date, ",")
-    from_date = Date.from_iso8601!(String.trim(from))
-    to_date = Date.from_iso8601!(String.trim(to))
-
-    %__MODULE__{
-      period: "custom",
-      date_range: Date.range(from_date, to_date),
-      interval: Map.get(params, "interval", "date"),
-      filters: parse_filters(params),
-      sample_threshold: Map.get(params, "sample_threshold", @default_sample_threshold)
-    }
-  end
-
-  def from(tz, params) do
-    __MODULE__.from(tz, Map.merge(params, %{"period" => "30d"}))
-  end
-
-  def put_filter(query, key, val) do
-    %__MODULE__{
-      query
-      | filters: Map.put(query.filters, key, val)
-    }
-  end
-
-  def treat_page_filter_as_entry_page(%__MODULE__{filters: %{"visit:entry_page" => _}} = q), do: q
-
-  def treat_page_filter_as_entry_page(%__MODULE__{filters: %{"event:page" => f}} = q) do
-    q
-    |> put_filter("visit:entry_page", f)
-    |> put_filter("event:page", nil)
-  end
-
-  def treat_page_filter_as_entry_page(q), do: q
-
-  def remove_goal(query) do
-    props =
-      Enum.map(query.filters, fn {key, _val} -> key end)
-      |> Enum.filter(fn filter_key -> String.starts_with?(filter_key, "event:props:") end)
-
-    new_filters =
-      query.filters
-      |> Map.drop(props)
-      |> Map.delete("event:goal")
-      |> Map.put("event:name", {:is, "pageview"})
-
-    %__MODULE__{query | filters: new_filters}
-  end
-
-  defp today(tz) do
-    Timex.now(tz) |> Timex.to_date()
-  end
-
-  defp parse_single_date(tz, params) do
-    case params["date"] do
-      "today" -> Timex.now(tz) |> Timex.to_date()
-      date when is_binary(date) -> Date.from_iso8601!(date)
-      _ -> Timex.now(tz) |> Timex.to_date()
+      {:ok, query}
     end
   end
 
-  defp parse_filters(%{"filters" => filters}) when is_binary(filters) do
-    case Jason.decode(filters) do
-      {:ok, parsed} -> parsed
-      {:error, err} -> parse_filter_expression(err.data)
+  @doc """
+  Builds query from old-style params. New code should prefer Query.build
+  """
+  def from(site, params, debug_metadata \\ %{}, now \\ nil) do
+    Legacy.QueryBuilder.from(site, params, debug_metadata, now)
+  end
+
+  def date_range(query, options \\ []) do
+    date_range = DateTimeRange.to_date_range(query.utc_time_range, query.timezone)
+
+    if Keyword.get(options, :trim_trailing) do
+      today = query.now |> DateTime.shift_zone!(query.timezone) |> DateTime.to_date()
+
+      Date.range(
+        date_range.first,
+        clamp(today, date_range)
+      )
+    else
+      date_range
     end
   end
 
-  defp parse_filters(%{"filters" => filters}) when is_map(filters), do: filters
-  defp parse_filters(_), do: %{}
-
-  defp parse_filter_expression(str) do
-    filters = String.split(str, ";")
-
-    Enum.map(filters, &parse_single_filter/1)
-    |> Enum.into(%{})
-  end
-
-  defp parse_single_filter(str) do
-    [key, val] =
-      String.trim(str)
-      |> String.split(["==", "!="], trim: true)
-      |> Enum.map(&String.trim/1)
-
-    is_negated = String.contains?(str, "!=")
-    is_list = String.contains?(val, "|")
-
+  defp clamp(date, date_range) do
     cond do
-      key == "event:goal" -> {key, parse_goal_filter(val)}
-      is_list -> {key, {:member, String.split(val, "|")}}
-      is_negated -> {key, {:is_not, val}}
-      true -> {key, {:is, val}}
+      date in date_range -> date
+      Date.before?(date, date_range.first) -> date_range.first
+      Date.after?(date, date_range.last) -> date_range.last
     end
   end
 
-  defp parse_goal_filter("Visit " <> page), do: {:is, :page, page}
-  defp parse_goal_filter(event), do: {:is, :event, event}
+  def set(query, keywords) do
+    new_query = struct!(query, keywords)
+
+    if Keyword.has_key?(keywords, :include_imported) do
+      new_query
+    else
+      refresh_imported_opts(new_query)
+    end
+  end
+
+  def set_include(query, key, value) do
+    struct!(query, include: Map.put(query.include, key, value))
+  end
+
+  def add_filter(query, filter) do
+    query
+    |> struct!(filters: query.filters ++ [filter])
+    |> refresh_imported_opts()
+  end
+
+  @doc """
+  Removes top level filters matching any of passed prefix from the query.
+
+  Note that this doesn't handle cases with AND/OR/NOT and as such is discouraged
+  from use.
+  """
+  def remove_top_level_filters(query, prefixes) do
+    new_filters =
+      Enum.reject(query.filters, fn [_, dimension_or_filter_tree | _rest] ->
+        is_binary(dimension_or_filter_tree) and
+          Enum.any?(prefixes, &String.starts_with?(dimension_or_filter_tree, &1))
+      end)
+
+    query
+    |> struct!(filters: new_filters)
+    |> refresh_imported_opts()
+  end
+
+  defp refresh_imported_opts(query) do
+    put_imported_opts(query, nil)
+  end
+
+  def put_imported_opts(query, site) do
+    requested? = query.include.imports
+
+    latest_import_end_date =
+      if site do
+        Plausible.Imported.latest_import_end_date(site)
+      else
+        query.latest_import_end_date
+      end
+
+    query = struct!(query, latest_import_end_date: latest_import_end_date)
+
+    skip_imported_reason = get_skip_imported_reason(query)
+
+    struct!(query,
+      include_imported: requested? and is_nil(skip_imported_reason),
+      skip_imported_reason: skip_imported_reason
+    )
+  end
+
+  @spec get_skip_imported_reason(t()) ::
+          nil | :no_imported_data | :out_of_range | :unsupported_query
+  def get_skip_imported_reason(query) do
+    cond do
+      is_nil(query.latest_import_end_date) ->
+        :no_imported_data
+
+      query.period in ["realtime", "30m"] or
+          Date.after?(date_range(query).first, query.latest_import_end_date) ->
+        :out_of_range
+
+      "time:minute" in query.dimensions or "time:hour" in query.dimensions ->
+        :unsupported_interval
+
+      not Imported.schema_supports_query?(query) ->
+        :unsupported_query
+
+      true ->
+        nil
+    end
+  end
+
+  @spec trace(%__MODULE__{}, [atom()]) :: %__MODULE__{}
+  def trace(%__MODULE__{} = query, metrics) do
+    filter_dimensions =
+      query.filters
+      |> Plausible.Stats.Filters.dimensions_used_in_filters()
+      |> Enum.sort()
+      |> Enum.uniq()
+      |> Enum.join(";")
+
+    metrics = metrics |> Enum.sort() |> Enum.join(";")
+
+    Tracer.set_attributes([
+      {"plausible.query.interval", query.interval},
+      {"plausible.query.period", query.period},
+      {"plausible.query.dimensions", query.dimensions |> Enum.join(";")},
+      {"plausible.query.include_imported", query.include_imported},
+      {"plausible.query.filter_keys", filter_dimensions},
+      {"plausible.query.metrics", metrics}
+    ])
+
+    query
+  end
 end

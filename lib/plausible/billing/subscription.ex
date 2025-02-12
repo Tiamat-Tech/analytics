@@ -1,6 +1,12 @@
 defmodule Plausible.Billing.Subscription do
+  @moduledoc false
+
   use Ecto.Schema
   import Ecto.Changeset
+  require Plausible.Billing.Subscription.Status
+  alias Plausible.Billing.Subscription
+
+  @type t() :: %__MODULE__{}
 
   @required_fields [
     :paddle_subscription_id,
@@ -10,46 +16,49 @@ defmodule Plausible.Billing.Subscription do
     :status,
     :next_bill_amount,
     :next_bill_date,
-    :user_id,
     :currency_code
   ]
 
   @optional_fields [:last_bill_date]
-  @valid_statuses ["active", "past_due", "deleted", "paused"]
 
   schema "subscriptions" do
     field :paddle_subscription_id, :string
     field :paddle_plan_id, :string
     field :update_url, :string
     field :cancel_url, :string
-    field :status, :string
+    field :status, Ecto.Enum, values: Subscription.Status.valid_statuses()
     field :next_bill_amount, :string
     field :next_bill_date, :date
     field :last_bill_date, :date
     field :currency_code, :string
 
-    belongs_to :user, Plausible.Auth.User
+    belongs_to :team, Plausible.Teams.Team
 
     timestamps()
   end
 
-  def changeset(model, attrs \\ %{}) do
-    model
+  def create_changeset(team, attrs \\ %{}) do
+    %__MODULE__{}
+    |> changeset(attrs)
+    |> put_assoc(:team, team)
+  end
+
+  def changeset(subscription, attrs \\ %{}) do
+    subscription
     |> cast(attrs, @required_fields ++ @optional_fields)
     |> validate_required(@required_fields)
-    |> validate_inclusion(:status, @valid_statuses)
     |> unique_constraint(:paddle_subscription_id)
   end
 
-  def free(attrs \\ %{}) do
+  def free(team, attrs \\ %{}) do
     %__MODULE__{
       paddle_plan_id: "free_10k",
-      status: "active",
-      next_bill_amount: "0"
+      status: Subscription.Status.active(),
+      next_bill_amount: "0",
+      currency_code: "EUR"
     }
-    |> cast(attrs, @required_fields)
-    |> validate_required([:user_id])
-    |> validate_inclusion(:status, @valid_statuses)
+    |> cast(attrs, @required_fields ++ @optional_fields)
+    |> put_assoc(:team, team)
     |> unique_constraint(:paddle_subscription_id)
   end
 end

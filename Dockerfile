@@ -2,70 +2,85 @@
 # platform specific, it makes sense to build it in the docker
 
 #### Builder
-FROM hexpm/elixir:1.12.2-erlang-24.0-alpine-3.13.3 as buildcontainer
+FROM hexpm/elixir:1.17.3-erlang-27.2.1-alpine-3.20.5 AS buildcontainer
+
+ARG MIX_ENV=ce
 
 # preparation
-ARG APP_VER=0.0.1
-ENV MIX_ENV=prod
+ENV MIX_ENV=$MIX_ENV
 ENV NODE_ENV=production
-ENV APP_VERSION=$APP_VER
+ENV NODE_OPTIONS=--openssl-legacy-provider
+
+# custom ERL_FLAGS are passed for (public) multi-platform builds
+# to fix qemu segfault, more info: https://github.com/erlang/otp/pull/6340
+ARG ERL_FLAGS
+ENV ERL_FLAGS=$ERL_FLAGS
 
 RUN mkdir /app
 WORKDIR /app
 
 # install build dependencies
-RUN apk add --no-cache git nodejs yarn python3 npm ca-certificates wget gnupg make erlang gcc libc-dev && \
-    npm install npm@latest -g && \
-    npm install -g webpack
+RUN apk add --no-cache git "nodejs-current=21.7.3-r0" yarn npm python3 ca-certificates wget gnupg make gcc libc-dev brotli
 
 COPY mix.exs ./
 COPY mix.lock ./
+COPY config ./config
 RUN mix local.hex --force && \
-    mix local.rebar --force && \
-    mix deps.get --only prod && \
-    mix deps.compile
+  mix local.rebar --force && \
+  mix deps.get --only ${MIX_ENV} && \
+  mix deps.compile
 
 COPY assets/package.json assets/package-lock.json ./assets/
 COPY tracker/package.json tracker/package-lock.json ./tracker/
 
 RUN npm install --prefix ./assets && \
-    npm install --prefix ./tracker
+  npm install --prefix ./tracker
 
 COPY assets ./assets
 COPY tracker ./tracker
-COPY config ./config
 COPY priv ./priv
 COPY lib ./lib
+COPY extra ./extra
+COPY storybook ./storybook
 
-RUN npm run deploy --prefix ./assets && \
-    npm run deploy --prefix ./tracker && \
-    mix phx.digest priv/static && \
-    mix download_country_database && \
-# https://hexdocs.pm/sentry/Sentry.Sources.html#module-source-code-storage
-    mix sentry_recompile
+RUN npm run deploy --prefix ./tracker && \
+  mix assets.deploy && \
+  mix phx.digest priv/static && \
+  mix download_country_database && \
+  mix sentry.package_source_code
 
 WORKDIR /app
 COPY rel rel
 RUN mix release plausible
 
 # Main Docker Image
-FROM alpine:3.13.3
-LABEL maintainer="tckb <tckb@tgrthi.me>"
+FROM alpine:3.20.5
+LABEL maintainer="plausible.io <hello@plausible.io>"
+
+ARG BUILD_METADATA={}
+ENV BUILD_METADATA=$BUILD_METADATA
 ENV LANG=C.UTF-8
+ARG MIX_ENV=ce
+ENV MIX_ENV=$MIX_ENV
 
-RUN apk update && apk upgrade
+RUN adduser -S -H -u 999 -G nogroup plausible
 
-RUN apk add --no-cache openssl ncurses libstdc++ libgcc
+RUN apk upgrade --no-cache
+RUN apk add --no-cache openssl ncurses libstdc++ libgcc ca-certificates \
+  && if [ "$MIX_ENV" = "ce" ]; then apk add --no-cache certbot; fi
 
-COPY .gitlab/build-scripts/docker-entrypoint.sh /entrypoint.sh
+COPY --from=buildcontainer --chmod=555 /app/_build/${MIX_ENV}/rel/plausible /app
+COPY --chmod=755 ./rel/docker-entrypoint.sh /entrypoint.sh
 
-RUN chmod a+x /entrypoint.sh && \
-    adduser -h /app -u 1000 -s /bin/sh -D plausibleuser
+# we need to allow "others" access to app folder, because
+# docker container can be started with arbitrary uid
+RUN mkdir -p /var/lib/plausible && chmod ugo+rw -R /var/lib/plausible
 
-COPY --from=buildcontainer /app/_build/prod/rel/plausible /app
-RUN chown -R plausibleuser:plausibleuser /app
-USER plausibleuser
+USER 999
 WORKDIR /app
+ENV LISTEN_IP=0.0.0.0
 ENTRYPOINT ["/entrypoint.sh"]
 EXPOSE 8000
+ENV DEFAULT_DATA_DIR=/var/lib/plausible
+VOLUME /var/lib/plausible
 CMD ["run"]
