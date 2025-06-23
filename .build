@@ -151,6 +151,7 @@ Plausible.Plugins.API.SharedLinks.html
 Plausible.Plugins.API.Token.html
 Plausible.Plugins.API.Tokens.html
 Plausible.Plugs.AuthorizeTeamAccess.html
+Plausible.Plugs.RestrictUserType.html
 Plausible.PromEx.Buckets.html
 Plausible.PromEx.Plugins.PlausibleMetrics.html
 Plausible.PromEx.StripedPeep.html
@@ -395,6 +396,7 @@ PlausibleWeb.Live.Sites.html
 PlausibleWeb.Live.TeamManagement.html
 PlausibleWeb.Live.TeamSetup.html
 PlausibleWeb.Live.Verification.html
+PlausibleWeb.LoginPreference.html
 PlausibleWeb.MJML.StatsReport.html
 PlausibleWeb.PageController.html
 PlausibleWeb.PageView.html
@@ -502,8 +504,8 @@ dist/lato-latin-ext-300-normal-VPGGJKJL.woff2
 dist/lato-latin-ext-400-normal-N27NCBWW.woff2
 dist/lato-latin-ext-700-normal-Q2L5DVMW.woff2
 dist/remixicon-NKANDIL5.woff2
-dist/search_data-B8F2A05B.js
-dist/sidebar_items-7054E770.js
+dist/search_data-7F14C4AA.js
+dist/sidebar_items-F23AF016.js
 index.html
 readme.html
 search.html
